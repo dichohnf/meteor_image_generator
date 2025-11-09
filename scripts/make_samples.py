@@ -1,12 +1,14 @@
-import argparse, os, sys, glob, math, time
-import torch
+import argparse
+import glob
+import os
+import sys
+
 import numpy as np
-from omegaconf import OmegaConf
+import torch
 from PIL import Image
-from torch.utils.data import DataLoader
+from omegaconf import OmegaConf
 from torch.utils.data.dataloader import default_collate
 from tqdm import trange
-
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, os.pardir))
@@ -282,7 +284,7 @@ if __name__ == "__main__":
     config = OmegaConf.merge(*configs, cli)
 
     print(ckpt)
-    gpu = True
+    gpu = torch.cuda.is_available()
     eval_mode = True
     show_config = False
     if show_config:

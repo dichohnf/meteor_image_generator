@@ -69,10 +69,7 @@ def run_conditional(model, dsets, outdir, top_k, temperature, batch_size=1):
         idx = z_indices
 
         half_sample = False
-        if half_sample:
-            start = idx.shape[1]//2
-        else:
-            start = 0
+        start = idx.shape[1]//2 if half_sample else 0
 
         idx[:,start:] = 0
         idx = idx.reshape(cshape[0],cshape[2],cshape[3])

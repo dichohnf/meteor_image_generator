@@ -341,7 +341,9 @@ def sample(model, x, steps, temperature=1.0, sample=False, top_k=None):
         # optionally crop probabilities to only the top k options
         if top_k is not None:
             logits = top_k_logits(logits, top_k)
-        # apply softmax to convert to probabilities
+
+        # TODO new code here
+
         probs = F.softmax(logits, dim=-1)
         # sample from the distribution or take the most likely
         if sample:

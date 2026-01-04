@@ -14,6 +14,8 @@ import logging
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from typing import List
+
 
 def top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float("Inf"), min_tokens_to_keep=1):
     """Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
@@ -342,7 +344,13 @@ def sample(model, x, steps, temperature=1.0, sample=False, top_k=None):
         if top_k is not None:
             logits = top_k_logits(logits, top_k)
 
-        # TODO new code here
+
+
+        # Here we need to have the message to encode
+        # Sort the top_k indexes
+        # Pick the index to encrypt message
+
+
 
         probs = F.softmax(logits, dim=-1)
         # sample from the distribution or take the most likely

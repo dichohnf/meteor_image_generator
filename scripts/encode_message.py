@@ -439,7 +439,7 @@ def encode_meteor(model, enc, message, context, finish_sent=False, device='cuda'
     return output[len(context):].tolist(), avg_NLL, avg_KL, words_per_bit, avg_Hq
 
 
-def decode_meteor(model, text, context, device='cuda', temp=1.0, precision=16, topk=50000, is_sort=False,
+def decode_meteor(model, image, context, device='cuda', temp=1.0, precision=16, topk=50000, is_sort=False,
                   input_key=sample_key, input_nonce=sample_nonce_counter):
 
     context = torch.tensor(context[-1022:], device=device, dtype=torch.long)
@@ -831,26 +831,32 @@ def decode_arithmetic(model, enc, text, context, device='cuda', temp=1.0, precis
 
 
 # @title
-def encode_message(model, message_str, context, key, nonce):
+def init_context(model, steps:int, topk:int=50000, device:int='cuda'):
+    with model.eval():
+        for step in range(steps):
+            logits =
+
+
+def embed_message_in_image(model, message_str, key:bytes, nonce:bytes, init_context_steps : int = 3):
     temp = 0.95
     precision = 32
     topk = 50000
+    device='cuda'
 
     finish_sent = False
     meteor_sort = False
     meteor_random = False
 
-    # First encode message to uniform bits, without any context
-    # (not essential this is arithmetic vs ascii, but it's more efficient when the message is natural language)
-    context_tokens = encode_context(context, enc)
-    message_ctx = [enc.encoder['<|endoftext|>']]
     message_str += '<eos>'
+
+    context = init_context(model, init_context_steps, topk=topk, device=device)
+
     message = decode_arithmetic(
-        model, enc, message_str, message_ctx, precision=40, topk=60000, device=device)
+        model, message_str, precision=40, topk=60000, device=device)
 
     # Next encode bits into cover text, using arbitrary context
     Hq = 0
-    out, nll, kl, words_per_bit, Hq = encode_meteor(model, enc, message, context_tokens, temp=temp,
+    out, nll, kl, words_per_bit, Hq = encode_meteor(model, message, temp=temp,
                                                     finish_sent=finish_sent,
                                                     precision=precision, topk=topk, device=device, is_sort=meteor_sort,
                                                     randomize_key=meteor_random, input_key=key, input_nonce=nonce)
@@ -868,17 +874,18 @@ def encode_message(model, message_str, context, key, nonce):
         "wordsbit": words_per_bit,
         "entropy": Hq / 0.69315
     }
-    return text, stats
+    return text
 
 
-def decode_message(model, text, key, nonce):
+def retrieve_message_from_image(model, image, key:bytes, nonce:bytes):
     temp = 0.95
     precision = 32
     topk = 50000
+    device='cuda'
 
     meteor_sort = False
 
-    message_rec = decode_meteor(model, text, temp=temp,
+    message_rec = decode_meteor(model, image, temp=temp,
                                 precision=precision, topk=topk, device=device, is_sort=meteor_sort, input_key=key,
                                 input_nonce=nonce)
 
@@ -898,12 +905,10 @@ def main():
 
     model = get_vqgan_sflickr(device=device)
 
-    chosen_context = "Despite"
-    message_text = "sample text"
+    message_text = "Message to encode"
 
-    x = encode_message(model, message_text, chosen_context, b'\x03' * 64, b'\x01' * 64)
-    y = decode_message(model, x[0], chosen_context, b'\x03' * 64, b'\x01' * 64)
-
+    image = embed_message_in_image(model, message_text, b'\x03' * 64, b'\x01' * 64)
+    decoded_message = retrieve_message_from_image(model, image, b'\x03' * 64, b'\x01' * 64)
 
 
 if __name__ == '__main__':

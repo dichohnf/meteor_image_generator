@@ -66,29 +66,23 @@ def run_conditional(model, dsets, outdir, top_k, temperature, batch_size=1):
             c = c.squeeze(1).permute(0, 3, 1, 2).float()
             c = model.cond_stage_model.to_rgb(c)
 
-        idx = z_indices
+        idx = torch.zeros_like(z_indices)
 
-        half_sample = False
-        start = idx.shape[1]//2 if half_sample else 0
-
-        idx[:,start:] = 0
         idx = idx.reshape(cshape[0],cshape[2],cshape[3])
-        start_i = start//cshape[3]
-        start_j = start %cshape[3]
 
         cidx = c_indices
         cidx = cidx.reshape(quant_c.shape[0],quant_c.shape[2],quant_c.shape[3])
 
         sample = True
 
-        for i in range(start_i,cshape[2]-0):
+        for i in range(cshape[2]-0):
             if i <= 8:
                 local_i = i
             elif cshape[2]-i < 8:
                 local_i = 16-(cshape[2]-i)
             else:
                 local_i = 8
-            for j in range(start_j,cshape[3]-0):
+            for j in range(cshape[3]-0):
                 if j <= 8:
                     local_j = j
                 elif cshape[3]-j < 8:

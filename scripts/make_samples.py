@@ -27,6 +27,33 @@ def save_image(x, path):
     Image.fromarray(x).save(path)
 
 
+def local_indeces(index:int, max_len:int):
+    """
+    Calculate local indices and range start and end based on the given index and maximum
+    length. This function determines whether the local index is near the start, end, or
+    middle of the range, ensuring the correct limits within the maximum length.
+
+    Args:
+        index (int): The current index within the range.
+        max_len (int): The total length of the range.
+
+    Returns:
+        tuple[int, int, int]: A tuple containing the local index, the starting index
+        of the range, and the ending index of the range.
+    """
+    if index <= 8:
+        local_ind = index
+    elif max_len - index < 8:
+        local_ind = 16 - (max_len - index)
+    else:
+        local_ind = 8
+
+    idx_start = index - local_ind
+    idx_end = idx_start + 16
+
+    return local_ind, idx_start, idx_end
+
+
 @torch.no_grad()
 def run_conditional(model, dsets, outdir, top_k, temperature, batch_size=1):
     if len(dsets.datasets) > 1:
@@ -48,7 +75,7 @@ def run_conditional(model, dsets, outdir, top_k, temperature, batch_size=1):
         c = model.get_input(cond_key, example).to(model.device)
 
         scale_factor = 1.0
-        quant_z, z_indices = model.encode_to_z(x)
+        quant_z, z_indices = model.encode_to_z(x) # quant_z is the tensor representation of x, z_indices are the indices used to encode x
         quant_c, c_indices = model.encode_to_c(c)
 
         cshape = quant_z.shape
@@ -67,7 +94,6 @@ def run_conditional(model, dsets, outdir, top_k, temperature, batch_size=1):
             c = model.cond_stage_model.to_rgb(c)
 
         idx = torch.zeros_like(z_indices)
-
         idx = idx.reshape(cshape[0],cshape[2],cshape[3])
 
         cidx = c_indices
@@ -75,30 +101,22 @@ def run_conditional(model, dsets, outdir, top_k, temperature, batch_size=1):
 
         sample = True
 
-        for i in range(cshape[2]-0):
-            if i <= 8:
-                local_i = i
-            elif cshape[2]-i < 8:
-                local_i = 16-(cshape[2]-i)
-            else:
-                local_i = 8
-            for j in range(cshape[3]-0):
-                if j <= 8:
-                    local_j = j
-                elif cshape[3]-j < 8:
-                    local_j = 16-(cshape[3]-j)
-                else:
-                    local_j = 8
+        for i in range(cshape[2]):
+            # define window sizes for each patch over rows and columns (index 2 and 3)
+            local_i, i_start, i_end = local_indeces(i, cshape[2])
 
-                i_start = i-local_i
-                i_end = i_start+16
-                j_start = j-local_j
-                j_end = j_start+16
+            for j in range(cshape[3]):
+                local_j, j_start, j_end = local_indeces(j, cshape[3])
+
+
                 patch = idx[:,i_start:i_end,j_start:j_end]
                 patch = patch.reshape(patch.shape[0],-1)
                 cpatch = cidx[:, i_start:i_end, j_start:j_end]
                 cpatch = cpatch.reshape(cpatch.shape[0], -1)
                 patch = torch.cat((cpatch, patch), dim=1)
+                print(patch.shape)
+                print(model.transformer(torch.randn((1,3))))
+
                 logits,_ = model.transformer(patch[:,:-1])
                 logits = logits[:, -256:, :]
                 logits = logits.reshape(cshape[0],16,16,-1)

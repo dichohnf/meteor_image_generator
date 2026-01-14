@@ -1,5 +1,16 @@
+import glob
 import hashlib
 import hmac
+import sys
+from operator import mul
+from typing import Optional, Callable, TypeVar, Any
+
+from PIL import Image
+from omegaconf import OmegaConf
+from tqdm.auto import trange
+
+from scripts.make_samples import get_parser, load_model_and_dset, local_indeces, save_image
+
 
 class DRBG(object):
     def __init__(self, key, seed : bytes):
@@ -84,16 +95,58 @@ def encode_context(raw_text, enc):
     context_tokens = [enc.encoder['<|endoftext|>']] + enc.encode(raw_text)
     return context_tokens
 
-def get_vqgan_sflickr(seed=42, device='cuda'):
+def get_vqgan_sflckr(seed=42):
     np.random.seed(seed)
     torch.random.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
-    model = VQGAN.sflickr()
-    model.to(device)
-    model.eval()
+    sys.path.append(os.getcwd())
+    parser = get_parser()
+    opt, unknown = parser.parse_known_args()
 
-    return model
+    ckpt = None
+    if opt.resume:
+        if not os.path.exists(opt.resume):
+            raise ValueError("Cannot find {}".format(opt.resume))
+        if os.path.isfile(opt.resume):
+            paths = opt.resume.split("/")
+            try:
+                idx = len(paths) - paths[::-1].index("logs") + 1
+            except ValueError:
+                idx = -2  # take a guess: path/to/logdir/checkpoints/model.ckpt
+            logdir = "/".join(paths[:idx])
+            ckpt = opt.resume
+        else:
+            assert os.path.isdir(opt.resume), opt.resume
+            logdir = opt.resume.rstrip("/")
+            ckpt = os.path.join(logdir, "checkpoints", "last.ckpt")
+        print(f"logdir:{logdir}")
+        base_configs = sorted(glob.glob(os.path.join(logdir, "configs/*-project.yaml")))
+        opt.base = base_configs + opt.base
+
+    if opt.config:
+        if type(opt.config) == str:
+            opt.base = [opt.config]
+        else:
+            opt.base = [opt.base[-1]]
+
+    configs = [OmegaConf.load(cfg) for cfg in opt.base]
+    cli = OmegaConf.from_dotlist(unknown)
+    if opt.ignore_base_data:
+        for config in configs:
+            if hasattr(config, "data"): del config["data"]
+    config = OmegaConf.merge(*configs, cli)
+
+    gpu = torch.cuda.is_available()
+    eval_mode = True
+    show_config = False
+    if show_config:
+        print(OmegaConf.to_container(config))
+
+    dsets, model, _ = load_model_and_dset(config, ckpt, gpu, eval_mode)
+
+
+    return dsets, model
 
 
 # @title
@@ -830,58 +883,219 @@ def decode_arithmetic(model, enc, text, context, device='cuda', temp=1.0, precis
     return message
 
 
-# @title
-def init_context(model, steps:int, topk:int=50000, device:int='cuda'):
-    with model.eval():
-        for step in range(steps):
-            logits =
+def _save_chw_image(x: torch.Tensor, path: str) -> None:
+    """Save a CHW tensor in [-1, 1] as an RGB PNG."""
+    if x.dim() != 3 or x.shape[0] != 3:
+        raise ValueError(f"Expected CHW with C=3, got {tuple(x.shape)}")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    x_np = ((x.detach().cpu().numpy().transpose(1, 2, 0) + 1.0) * 127.5).clip(0, 255).astype("uint8")
+    Image.fromarray(x_np).save(path)
 
 
-def embed_message_in_image(model, message_str, key:bytes, nonce:bytes, init_context_steps : int = 3):
+@torch.no_grad()
+def sample_unconditional_codebook(
+    model,
+    h: int = 16,
+    w: int = 16,
+    temperature: float = 1.0,
+    top_k: Optional[int] = 100,
+    outdir: Optional[str] = None,
+    save_every: int = 0,
+) -> torch.Tensor:
+    """"
+    Sample a full (h*w) sequence of VQ codebook indices using model.transformer, starting from SOS.
+
+    Returns:
+        z_indices: LongTensor shape (1, h*w) suitable for model.decode_to_img(z_indices, zshape)
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    steps = h * w
+    vocab = int(model.transformer.config.vocab_size)
+    block_size = int(model.transformer.get_block_size())
+    sos = int(getattr(model, "sos_token", 0))
+
+    seq = torch.tensor([[sos]], device=device, dtype=torch.long)  # (1, 1)
+    generated = torch.empty((1, 0), device=device, dtype=torch.long)
+
+    zshape = (1, 256, h, w)
+
+    for step in range(steps):
+        seq_cond = seq if seq.size(1) <= block_size else seq[:, -block_size:]
+
+        logits, _ = model.transformer(seq_cond)      # (1, T, vocab)
+        logits = logits[:, -1, :] / temperature      # (1, vocab)
+
+        if top_k is not None:
+            logits = model.top_k_logits(logits, top_k)
+
+        probs = torch.softmax(logits, dim=-1)
+        next_tok = torch.multinomial(probs, num_samples=1)  # (1, 1)
+
+        seq = torch.cat([seq, next_tok], dim=1)
+        generated = torch.cat([generated, next_tok], dim=1)
+
+        if outdir is not None and save_every and ((step + 1) % save_every == 0 or (step + 1) == steps):
+            # IMPORTANT: decode_to_img needs exactly (h*w) tokens
+            padded = torch.zeros((1, steps), device=device, dtype=torch.long)
+            padded[:, :generated.shape[1]] = generated
+            x_preview = model.decode_to_img(padded, zshape).squeeze(0)  # CHW
+            _save_chw_image(x_preview, os.path.join(outdir, f"preview_{step+1:04}.png"))
+
+    return generated
+
+@torch.no_grad()
+def embed_message_in_image(model, dsets, message_str, key: bytes, nonce: bytes, init_context_steps: int = 3):
     temp = 0.95
     precision = 32
-    topk = 50000
-    device='cuda'
+    temperature = 1.0
+    batch_size = 1
+    top_k = 10
+    outdir = "examples"
+    from torch.utils.data import _utils
+    _T = TypeVar("_T")
+    _T_co = TypeVar("_T_co", covariant=True)
+    _worker_init_fn_t = Callable[[int], None]
+    _collate_fn_t = Callable[[list[_T]], Any]
+    default_collate: _collate_fn_t = _utils.collate.default_collate
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    finish_sent = False
-    meteor_sort = False
-    meteor_random = False
+    # Generate a full token grid from scratch (no initial image)
 
-    message_str += '<eos>'
+    if len(dsets.datasets) > 1:
+        split = sorted(dsets.datasets.keys())[0]
+        dset = dsets.datasets[split]
+    else:
+        dset = next(iter(dsets.datasets.values()))
+    print("Dataset: ", dset.__class__.__name__)
+    for start_idx in trange(0,len(dset)-batch_size+1,batch_size):
+        indices = list(range(start_idx, start_idx+batch_size))
+        example = default_collate([dset[i] for i in indices])
 
-    context = init_context(model, init_context_steps, topk=topk, device=device)
+        x = model.get_input("image", example).to(model.device)
+        for i in range(x.shape[0]):
+            save_image(x[i], os.path.join(outdir, "originals",
+                                          "{:06}.png".format(indices[i])))
 
-    message = decode_arithmetic(
-        model, message_str, precision=40, topk=60000, device=device)
+        cond_key = model.cond_stage_key
+        c = model.get_input(cond_key, example).to(model.device)
 
-    # Next encode bits into cover text, using arbitrary context
-    Hq = 0
-    out, nll, kl, words_per_bit, Hq = encode_meteor(model, message, temp=temp,
-                                                    finish_sent=finish_sent,
-                                                    precision=precision, topk=topk, device=device, is_sort=meteor_sort,
-                                                    randomize_key=meteor_random, input_key=key, input_nonce=nonce)
-    text = enc.decode(out)
+        scale_factor = 1.0
+        quant_z, z_indices = model.encode_to_z(x) # quant_z is the tensor representation of x, z_indices are the indices used to encode x
+        quant_c, c_indices = model.encode_to_c(c)
 
-    print("=" * 40 + " Encoding " + "=" * 40)
-    print(text)
-    print('=> ppl: %0.2f, kl: %0.3f, words/bit: %0.2f, bits/word: %0.2f, entropy: %.2f' %
-          (math.exp(nll), kl, words_per_bit, 1 / words_per_bit, Hq / 0.69315))
-    print("=" * 90)
+        # cshape: (batch_size, num_channels, height, width)
+        cshape = quant_z.shape
 
-    stats = {
-        "ppl": math.exp(nll),
-        "kl": kl,
-        "wordsbit": words_per_bit,
-        "entropy": Hq / 0.69315
-    }
-    return text
+        xrec = model.first_stage_model.decode(quant_z)
+        for i in range(xrec.shape[0]):
+            save_image(xrec[i], os.path.join(outdir, "reconstructions",
+                                             "{:06}.png".format(indices[i])))
+
+        idx = torch.zeros_like(z_indices)
+        idx = idx.reshape(cshape[0],cshape[2],cshape[3])
+
+        cidx = c_indices
+        cidx = cidx.reshape(quant_c.shape[0],quant_c.shape[2],quant_c.shape[3])
+
+        sample = False
+
+        for i in range(cshape[2]):
+            # define window sizes for each patch over rows and columns (index 2 and 3)
+            local_i, i_start, i_end = local_indeces(i, cshape[2])
+
+            for j in range(cshape[3]):
+                local_j, j_start, j_end = local_indeces(j, cshape[3])
+
+
+                patch = idx[:,i_start:i_end,j_start:j_end]
+                patch = patch.reshape(patch.shape[0],-1)
+                cpatch = cidx[:, i_start:i_end, j_start:j_end]
+                cpatch = cpatch.reshape(cpatch.shape[0], -1)
+                patch = torch.cat((cpatch, patch), dim=1)
+
+                logits,_ = model.transformer(patch[:,:-1])
+                logits = logits[:, -256:, :]
+                logits = logits.reshape(cshape[0],16,16,-1)
+                logits = logits[:,local_i,local_j,:]
+
+                logits = logits/temperature
+
+                if top_k is not None:
+                    logits = model.top_k_logits(logits, top_k)
+                # apply softmax to convert to probabilities
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+                # sample from the distribution or take the most likely
+                if sample:
+                    ix = torch.multinomial(probs, num_samples=1)
+                else:
+                    _, ix = torch.topk(probs, k=1, dim=-1)
+                idx[:,i,j] = ix
+
+        xsample = model.decode_to_img(idx[:,:cshape[2],:cshape[3]], cshape)
+        for i in range(xsample.shape[0]):
+            save_image(xsample[i], os.path.join(outdir, "samples",
+                                                "{:06}.png".format(indices[i])))
+
+    print("Done")
+    return
+
+    z_indices = sample_unconditional_codebook(
+        model,
+        h=16,
+        w=16,
+        temperature=1.0,
+        top_k=100,
+        outdir=debug_dir,
+        save_every=32,   # set 0 to disable intermediate previews
+    )
+
+    # Decode final image
+    zshape = (1, 256, 16, 16)
+    context_image = model.decode_to_img(z_indices, zshape).squeeze(0)  # CHW in [-1, 1]
+    _save_chw_image(context_image, os.path.join(debug_dir, "final.png"))
+
+    # Context is the generated token sequence (if you need it later)
+    context = z_indices[0].tolist()
+
+    return context_image
+
+    # "Context is done once generated the first three tokens":
+    # here your context could simply be `z_indices` (tokens), and `context_image` is the visualization.
+    return context_image
+
+    # message = decode_arithmetic(
+    #     model, message_str, precision=40, topk=60000, device=device)
+    #
+    # # Next encode bits into cover text, using arbitrary context
+    # Hq = 0
+    # out, nll, kl, words_per_bit, Hq = encode_meteor(model, message, temp=temp,
+    #                                                 finish_sent=finish_sent,
+    #                                                 precision=precision, topk=topk, device=device, is_sort=meteor_sort,
+    #                                                 randomize_key=meteor_random, input_key=key, input_nonce=nonce)
+    # text = enc.decode(out)
+    #
+    # print("=" * 40 + " Encoding " + "=" * 40)
+    # print(text)
+    # print('=> ppl: %0.2f, kl: %0.3f, words/bit: %0.2f, bits/word: %0.2f, entropy: %.2f' %
+    #       (math.exp(nll), kl, words_per_bit, 1 / words_per_bit, Hq / 0.69315))
+    # print("=" * 90)
+    #
+    # stats = {\
+    #     "ppl": math.exp(nll),
+    #     "kl": kl,
+    #     "wordsbit": words_per_bit,
+    #     "entropy": Hq / 0.69315
+    # }
+    # return text
 
 
 def retrieve_message_from_image(model, image, key:bytes, nonce:bytes):
     temp = 0.95
     precision = 32
     topk = 50000
-    device='cuda'
+    device='cuda' if torch.cuda.is_available() else 'cpu'
 
     meteor_sort = False
 
@@ -901,20 +1115,16 @@ def retrieve_message_from_image(model, image, key:bytes, nonce:bytes):
     return reconst[:-5]
 
 def main():
-    device = 'cuda'
-
-    model = get_vqgan_sflickr(device=device)
+    dsets, model = get_vqgan_sflckr()
 
     message_text = "Message to encode"
 
-    image = embed_message_in_image(model, message_text, b'\x03' * 64, b'\x01' * 64)
-    decoded_message = retrieve_message_from_image(model, image, b'\x03' * 64, b'\x01' * 64)
+    image = embed_message_in_image(model, dsets, message_text, b'\x03' * 64, b'\x01' * 64)
+    # decoded_message = retrieve_message_from_image(model, image, b'\x03' * 64, b'\x01' * 64)
 
 
 if __name__ == '__main__':
     main()
-
-
 
 
 # import glob

@@ -78,6 +78,7 @@ def run_conditional(model, dsets, outdir, top_k, temperature, batch_size=1):
         quant_z, z_indices = model.encode_to_z(x) # quant_z is the tensor representation of x, z_indices are the indices used to encode x
         quant_c, c_indices = model.encode_to_c(c)
 
+        # cshape: (batch_size, num_channels, height, width)
         cshape = quant_z.shape
 
         xrec = model.first_stage_model.decode(quant_z)
@@ -85,21 +86,13 @@ def run_conditional(model, dsets, outdir, top_k, temperature, batch_size=1):
             save_image(xrec[i], os.path.join(outdir, "reconstructions",
                                              "{:06}.png".format(indices[i])))
 
-        if cond_key == "segmentation":
-            # get image from segmentation mask
-            num_classes = c.shape[1]
-            c = torch.argmax(c, dim=1, keepdim=True)
-            c = torch.nn.functional.one_hot(c, num_classes=num_classes)
-            c = c.squeeze(1).permute(0, 3, 1, 2).float()
-            c = model.cond_stage_model.to_rgb(c)
-
         idx = torch.zeros_like(z_indices)
         idx = idx.reshape(cshape[0],cshape[2],cshape[3])
 
         cidx = c_indices
         cidx = cidx.reshape(quant_c.shape[0],quant_c.shape[2],quant_c.shape[3])
 
-        sample = True
+        sample = False
 
         for i in range(cshape[2]):
             # define window sizes for each patch over rows and columns (index 2 and 3)
@@ -114,8 +107,6 @@ def run_conditional(model, dsets, outdir, top_k, temperature, batch_size=1):
                 cpatch = cidx[:, i_start:i_end, j_start:j_end]
                 cpatch = cpatch.reshape(cpatch.shape[0], -1)
                 patch = torch.cat((cpatch, patch), dim=1)
-                print(patch.shape)
-                print(model.transformer(torch.randn((1,3))))
 
                 logits,_ = model.transformer(patch[:,:-1])
                 logits = logits[:, -256:, :]

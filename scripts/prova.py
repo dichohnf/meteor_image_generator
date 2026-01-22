@@ -174,18 +174,18 @@ def next_patch(model : torch.nn.Module,
                top_k : int = None,
                ) -> Tuple[Union[int, float, bool], int]:
 
-    return torch.randint(0, 1024, (1,)).item(), 10
+    # return torch.randint(0, 1024, (1,)).item(), 10
     if top_k is None:
         top_k = codebook_len
     model.eval()
 
     logits, _ = model.transformer(context[:-1].unsqueeze(0))
-    print(logits.shape)
+    # print(logits.shape)
     logits = logits[:, -256:, :].squeeze()
-    print(logits.shape)
+    # print(logits.shape)
     logits = logits.reshape(16, 16, -1)
     logits = logits[position[0], position[1], :]
-    print(logits.shape)
+    # print(logits.shape)
     # logits = logits.squeeze()
 
     # Sampling with Meteor
@@ -206,9 +206,10 @@ def next_patch(model : torch.nn.Module,
     probs_threshold = 1 / codebook_len
     k = min(max(2, torch.nonzero((probs < probs_threshold))[0].item()), top_k)
     probs_int = probs[:k]
+
     if random_sample:
-        # ix = torch.multinomial(probs_int, 1).item()
-        _, ix = torch.topk(probs, k=1)
+        ix = torch.multinomial(probs, 1)
+        # _, ix = torch.topk(probs, k=1)
         return ix.item(), 0
 
     probs_int = probs_int / probs_int.sum() * codebook_len
@@ -290,7 +291,7 @@ def complete_image(model : torch.nn.Module,
             if single_color_mode:
                 image[slices] = torch.tensor(color_combination).view(3, 1, 1)
             else:
-                 # TODO: change the next random method with the model token generation
+                 # TODO: change the random method with the model token generation
                 image[slices] = torch.rand((3, patch_size[1], patch_size[2]))
             current_w += patch_size[2]
         current_w = 0
@@ -319,11 +320,12 @@ def encode_message_to_image(message: str) -> torch.Tensor:
     # print(f"Message: {message}")
 
     dsets, model = get_vqgan_sflckr()
-    image = set_context(model, dsets, 512)
+    num_rows = 512
+    image = set_context(model, dsets, num_rows)
 
     print(f"Original image dimension: {image.unsqueeze(dim=0).shape}")
     codebook_translations, codebook_indices = model.encode_to_z(image.unsqueeze(0))
-    reconstructed_image = model.first_stage_model.decode(codebook_translations)
+    # reconstructed_image = model.first_stage_model.decode(codebook_translations)
     # show_image(reconstructed_image.squeeze(), plot_title="Reconstructed image")
 
     shape = (codebook_translations.shape[2],codebook_translations.shape[3])
@@ -340,17 +342,19 @@ def encode_message_to_image(message: str) -> torch.Tensor:
     remaining_bits = message_bits
     image_completed = False
 
-    next_h, next_w = 512, 0
+    next_h, next_w = num_rows // 16, 0
 
 
     # print(f"Image size: {image_size}\tPatch size: {patch_size}")
 
+    tot = len(remaining_bits)
     while remaining_bits:
+        print(f"Remaining: {len(remaining_bits)}/{tot}")
         next_encodable_bits = remaining_bits[:bits_length]
         # print(f"Next ten bits: {next_ten_bits}\tNext position: {(channels, next_h, next_w)}")
 
-        local_row, row_start, row_end = local_indexes(next_h // 16, image.shape[1])
-        local_col, col_start, col_end = local_indexes(next_w // 16, image.shape[2])
+        local_row, row_start, row_end = local_indexes(next_h, image.shape[1])
+        local_col, col_start, col_end = local_indexes(next_w, image.shape[2])
 
         cpatch = cidx[row_start:row_end, col_start:col_end].reshape(-1)
         patch  =  idx[row_start:row_end, col_start:col_end].reshape(-1)
@@ -358,63 +362,65 @@ def encode_message_to_image(message: str) -> torch.Tensor:
 
         selected_idx, encoded_bits_len = next_patch(model, context,
                                                     next_encodable_bits,
-                                                    (local_row,local_col),
-                                                    random_sample=True)
-        encoded_bits_len = 10
-
-        idx[local_row, local_col] = selected_idx
-        # print(idx[local_row, local_col])
+                                                    (local_row,local_col))
+        # print(f"Prev: pos:({local_row},{local_col}), idx:{idx[local_row,local_col]}")
+        idx[next_h, next_w] = selected_idx
+        # print(f"Succ: pos:({local_row},{local_col}), idx:{idx[local_row,local_col]}")
 
         # print(codebook_indices.shape)
         remaining_bits = remaining_bits[encoded_bits_len:]
         # print(len(remaining_bits))
         # show_image(image)
-        next_w = (next_w + patch_size[2]) % image_size[2]
-        if next_w <= 0:
-            next_h += patch_size[2]
-            if next_h >= image_size[1]:
+        next_w += 1
+        if next_w >= shape[1]:
+            next_w = 0
+            next_h += 1
+            if next_h >= shape[0]:
                 image_completed = True
                 print("Reached the end of the image!")
                 break
 
-    while not image_completed:
-        # print(next_h, next_w)
+    if image_completed:
+        idx[:num_rows // 16, :shape[1]] = cidx[:num_rows // 16, :shape[1]]
+        image = model.decode_to_img(idx.unsqueeze(0), codebook_translations.shape).squeeze()
+        return image
 
-        local_row, row_start, row_end = local_indexes(next_h // 16, image.shape[1])
-        local_col, col_start, col_end = local_indexes(next_w // 16, image.shape[2])
+    while True:
+        print(f"Remaining second loop: {next_h}/{shape[0]}")
+
+        local_row, row_start, row_end = local_indexes(next_h, image.shape[1])
+        local_col, col_start, col_end = local_indexes(next_w, image.shape[2])
 
         cpatch = cidx[row_start:row_end, col_start:col_end].reshape(-1)
-        patch = idx[row_start:row_end, col_start:col_end].reshape(-1)
+        patch  =  idx[row_start:row_end, col_start:col_end].reshape(-1)
         context = torch.cat((cpatch, patch), dim=0)
 
         selected_idx, encoded_bits_len = next_patch(model, context,
                                                     "",
                                                     (local_row, local_col),
                                                     random_sample=True)
-        idx[local_row, local_col] = selected_idx
-        next_w = (next_w + patch_size[2]) % image_size[2]
-        if next_w <= 0:
-            next_h += patch_size[2]
-            if next_h >= image_size[1]:
-                image_completed = True
-                print("Completed image!")
-
-    image = model.decode_to_img(idx[:shape[0], :shape[1]].unsqueeze(0), codebook_translations.shape).squeeze()
+        idx[next_h, next_w] = selected_idx
+        next_w += 1
+        if next_w >= shape[1]:
+            next_w = 0
+            next_h += 1
+            if next_h >= shape[0]:
+                print("Image completed!")
+                break
+    idx[:num_rows//16, :shape[1]] = cidx[:num_rows//16, :shape[1]]
+    image = model.decode_to_img(idx.unsqueeze(0), codebook_translations.shape).squeeze()
     return image
+
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def main():
-    message_to_encode = "Hello world!"
+    message_to_encode = "Hello world!"*15
 
-    torch.manual_seed(0)
+    torch.manual_seed(42)
     generated_image = encode_message_to_image(message_to_encode)
     show_image(generated_image)
-
-
-
-
 
 
 if __name__ == '__main__':

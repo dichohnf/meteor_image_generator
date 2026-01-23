@@ -17,7 +17,7 @@ LN2 = 0.69315  # ln(2) for entropy calculation
 
 
 @torch.no_grad()
-def set_context(model, dsets, num_rows: int) -> torch.Tensor:
+def set_context(model, dsets, num_rows: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Prepares and returns a context image from the given dataset.
 
@@ -47,21 +47,23 @@ def set_context(model, dsets, num_rows: int) -> torch.Tensor:
         dset = next(iter(dsets.datasets.values()))
 
     # Get random image
-    context_idx = torch.randint(len(dset), size=(1,))
-    example = default_collate([dset[context_idx.item()]])
-    x = model.get_input("image", example).to(model.device).squeeze()
+    context_idx = torch.randint(len(dset), size=(1,)).item()
+    example = default_collate([dset[context_idx]])
+
+    image = model.get_input("image", example).to(model.device).squeeze()
+    cond_tensor = model.get_input(model.cond_stage_key, example).to(model.device)
 
     # Validate and adjust num_rows
-    if num_rows > x.shape[1]:
-        num_rows = x.shape[1]
+    if num_rows > image.shape[1]:
+        num_rows = image.shape[1]
         print(f"WARNING: num_rows clamped to image height: {num_rows}")
 
     # Crop to align with PATCH_SIZE boundaries
-    height_crop = x.shape[1] - ((x.shape[1] - num_rows) % PATCH_SIZE)
-    width_crop = x.shape[2] - (x.shape[2] % PATCH_SIZE)
-    x = x[:, :height_crop, :width_crop]
+    height_crop = image.shape[1] - ((image.shape[1] - num_rows) % PATCH_SIZE)
+    width_crop = image.shape[2] - (image.shape[2] % PATCH_SIZE)
+    image = image[:, :height_crop, :width_crop]
 
-    return x
+    return image, cond_tensor
 
 
 def string2bits(message: str, code: str = 'ASCII') -> str:
@@ -233,14 +235,14 @@ def next_patch(
     logits, indices = logits.sort(descending=True)
     probs = torch.nn.functional.softmax(logits, dim=-1)
 
+    if random_sample:
+        selection = torch.multinomial(probs, 1).item()
+        return indices[selection].item(), 10
+
     # Apply probability threshold
     prob_threshold = 1 / codebook_len
     k = min(max(2, torch.nonzero(probs < prob_threshold)[0].item()), top_k)
     probs_int = probs[:k]
-
-    if random_sample:
-        selection = torch.multinomial(probs, 1).item()
-        return indices[selection].item(), 0
 
     # Convert probabilities to integer representation for arithmetic coding
     probs_int = (probs_int / probs_int.sum() * codebook_len).round().long()
@@ -376,19 +378,25 @@ def encode_message_to_image(message: str) -> torch.Tensor:
     dsets, model = get_vqgan_sflckr()
 
     print("=" * 40, " ENCODING ", "=" * 40)
-    image = set_context(model, dsets, DEFAULT_CONTEXT_ROWS)
+    image, cond_tensor = set_context(model, dsets, DEFAULT_CONTEXT_ROWS)
+    show_image(image, plot_title="Original image")
 
     print(f"Original image dimension: {image.unsqueeze(0).shape}")
-    codebook_translations, codebook_indices = model.encode_to_z(image.unsqueeze(0))
+    image_translations, image_indeces = model.encode_to_z(image.unsqueeze(0))
+    cond_translations, cond_indices = model.encode_to_c(cond_tensor)
+    show_image(model.first_stage_model.decode(image_translations).squeeze(), plot_title="Translated image")
 
-    grid_shape = (codebook_translations.shape[2], codebook_translations.shape[3])
-    reference_tensor = codebook_indices.squeeze().reshape(grid_shape)
-    building_tensor = torch.zeros_like(reference_tensor)
+    grid_shape = (image_translations.shape[2], image_translations.shape[3])
+
+    reference_tensor = cond_indices.reshape(
+        cond_translations.shape[0], cond_translations.shape[2], cond_translations.shape[3]
+    ).squeeze()
+    building_tensor = torch.zeros_like(image_indeces).reshape(grid_shape)
 
     message_bits = string2bits(message)
     remaining_bits = message_bits
 
-    current_row = DEFAULT_CONTEXT_ROWS // PATCH_SIZE
+    current_row = 0
     current_col = 0
 
     # Encode message bits
@@ -399,7 +407,7 @@ def encode_message_to_image(message: str) -> torch.Tensor:
             current_row, current_col, _, encoded_len = _encode_single_patch(
                 model, reference_tensor, building_tensor,
                 current_row, current_col, image.shape, grid_shape,
-                bits_to_encode=next_bits, random_sample=False
+                bits_to_encode=next_bits, random_sample=True
             )
 
             remaining_bits = remaining_bits[encoded_len:]
@@ -423,13 +431,17 @@ def encode_message_to_image(message: str) -> torch.Tensor:
 
     # Restore context region
     context_patches = DEFAULT_CONTEXT_ROWS // PATCH_SIZE
-    building_tensor[:context_patches, :] = reference_tensor[:context_patches, :]
+    # building_tensor[:context_patches, :] = reference_tensor[:context_patches, :]
 
     # Decode to image
     image = model.decode_to_img(
-        building_tensor.unsqueeze(0),
-        codebook_translations.shape
+        building_tensor[:grid_shape[0], :grid_shape[1]].unsqueeze(0),
+        image_translations.shape,
     ).squeeze()
+
+    with open("examples/selections_prova.txt", 'w') as f:
+        for idx in building_tensor.reshape(-1):
+            f.write(str(idx.item()) + "\n")
 
     return image
 

@@ -1,11 +1,16 @@
+import os
+import time
+
 import torch
-from matplotlib import pyplot as plt
 from torch import Tensor
 from torch.utils.data.dataloader import default_collate
+
 from typing import Tuple, List, Optional
+from PIL import Image
+from matplotlib import pyplot as plt
+from tqdm import tqdm, trange
 
-from tqdm import tqdm
-
+from main import DataModuleFromConfig
 from scripts.encode_message import get_vqgan_sflckr
 
 # Constants
@@ -364,63 +369,82 @@ def _encode_single_patch(
     return new_row, new_col, selected_idx, encoded_bits
 
 
-def encode_message_to_image(message: str) -> torch.Tensor:
+def encode_message_to_image(
+        message: str,
+        model: torch.nn.Module,
+        dsets : DataModuleFromConfig,
+        *,
+        random_sample: bool = False,
+        quiet: bool = False
+    ) -> torch.Tensor:
     """
     Encodes a text message into a generated image using steganography.
 
     Args:
         message: The text message to encode into the image.
+        model: The transformer model for prediction.
+        dsets: Dataset object containing the reference image.
+        quiet (Optional): Impose to remove all the console outputs.
+        random_sample (Optional): If True, samples randomly without encoding.
 
     Returns:
         torch.Tensor: A generated image tensor (C, H, W) containing the encoded message.
     """
-    print("=" * 30, "Setting up the model", "=" * 30)
-    dsets, model = get_vqgan_sflckr()
-
-    print("=" * 40, " ENCODING ", "=" * 40)
+    if not quiet:
+        print("=" * 40, " ENCODING ", "=" * 40)
     image, cond_tensor = set_context(model, dsets, DEFAULT_CONTEXT_ROWS)
-    show_image(image, plot_title="Original image")
+    if not quiet:
+        show_image(image, plot_title="Original image")
 
-    print(f"Original image dimension: {image.unsqueeze(0).shape}")
-    image_translations, image_indeces = model.encode_to_z(image.unsqueeze(0))
+    if not quiet:
+        print(f"Original image dimension: {image.unsqueeze(0).shape}")
+    image_translations, image_indices = model.encode_to_z(image.unsqueeze(0))
     cond_translations, cond_indices = model.encode_to_c(cond_tensor)
-    show_image(model.first_stage_model.decode(image_translations).squeeze(), plot_title="Translated image")
+    if not quiet:
+        show_image(model.first_stage_model.decode(image_translations).squeeze(), plot_title="Translated image")
 
     grid_shape = (image_translations.shape[2], image_translations.shape[3])
 
     reference_tensor = cond_indices.reshape(
         cond_translations.shape[0], cond_translations.shape[2], cond_translations.shape[3]
     ).squeeze()
-    building_tensor = torch.zeros_like(image_indeces).reshape(grid_shape)
+
+    half_start = image_indices.shape[1] // 20
+    building_tensor = image_indices
+    building_tensor[:, half_start:] = 0
+    building_tensor = building_tensor.reshape(grid_shape)
+
+    current_row = half_start // grid_shape[1]
+    current_col = half_start % grid_shape[1]
 
     message_bits = string2bits(message)
     remaining_bits = message_bits
 
-    current_row = 0
-    current_col = 0
-
     # Encode message bits
-    with tqdm(total=len(remaining_bits), desc="Encoding message") as pbar:
+    pbar = tqdm(total=len(remaining_bits), desc="Encoding message", disable=quiet)
+    with pbar:
         while remaining_bits:
             next_bits = remaining_bits[:DEFAULT_PRECISION_BITS]
 
             current_row, current_col, _, encoded_len = _encode_single_patch(
                 model, reference_tensor, building_tensor,
                 current_row, current_col, image.shape, grid_shape,
-                bits_to_encode=next_bits, random_sample=True
+                bits_to_encode=next_bits, random_sample=random_sample
             )
 
             remaining_bits = remaining_bits[encoded_len:]
             pbar.update(encoded_len)
 
             if current_row >= grid_shape[0]:
-                print("Reached the end of the image!")
+                if not quiet:
+                    print("Reached the end of the image!")
                 break
 
     # Fill remaining patches with random samples
     if current_row < grid_shape[0]:
         total_remaining = (grid_shape[0] - current_row) * grid_shape[1] - current_col
-        with tqdm(total=total_remaining, desc="Filling remaining patches") as pbar:
+        pbar = tqdm(total=total_remaining, desc="Filling remaining patches", disable=quiet)
+        with pbar:
             while current_row < grid_shape[0]:
                 current_row, current_col, _, _ = _encode_single_patch(
                     model, reference_tensor, building_tensor,
@@ -439,20 +463,29 @@ def encode_message_to_image(message: str) -> torch.Tensor:
         image_translations.shape,
     ).squeeze()
 
-    with open("examples/selections_prova.txt", 'w') as f:
-        for idx in building_tensor.reshape(-1):
-            f.write(str(idx.item()) + "\n")
-
     return image
+
+
+def save_image(image: torch.Tensor, random:bool):
+    x_np = ((image.detach().cpu().numpy().transpose(1, 2, 0) + 1.0) * 127.5).clip(0, 255).astype("uint8")
+    Image.fromarray(x_np).save(os.path.join("examples", "half_samples", "meteor" if not random else "random", str(time.time_ns()) + ".png"), "PNG")
 
 
 def main():
     """Main entry point for message encoding demonstration."""
     message_to_encode = "Hello world!" * 15
 
-    torch.manual_seed(42)
-    generated_image = encode_message_to_image(message_to_encode)
-    show_image(generated_image, plot_title="Generated Image with Encoded Message")
+    # TODO: move setup and parsing here to parse output dir
+    quiet = True
+    random_sample = True
+
+    print("=" * 30, "Setting up the model", "=" * 30)
+    dsets, model = get_vqgan_sflckr(42)
+    for _ in trange(5):
+        generated_image = encode_message_to_image(message_to_encode, model, dsets, random_sample = random_sample, quiet=quiet)
+        save_image(generated_image, random_sample)
+        if not quiet:
+            show_image(generated_image, plot_title="Generated Image with Encoded Message")
 
 
 if __name__ == '__main__':

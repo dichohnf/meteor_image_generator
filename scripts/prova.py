@@ -295,7 +295,7 @@ def build_context_from_patches(
         building_indices: torch.Tensor,
         current_row: int,
         current_col: int,
-        image_shape: torch.Size
+        grid_shape: Tuple[int, int]
 ) -> Tuple[Tensor, Tuple[int, int]]:
     """
     Builds a context tensor by concatenating reference and current patch sequences.
@@ -305,13 +305,13 @@ def build_context_from_patches(
         building_indices: Current generated codebook indices.
         current_row: Current row position in the patch grid.
         current_col: Current column position in the patch grid.
-        image_shape: Shape of the image tensor.
+        grid_shape: Shape of the patch translation.
 
     Returns:
         Tuple[Tensor, Tuple[int, int]]: (context_tensor, (local_row, local_col))
     """
-    local_row, row_start, row_end = local_indexes(current_row, image_shape[1])
-    local_col, col_start, col_end = local_indexes(current_col, image_shape[2])
+    local_row, row_start, row_end = local_indexes(current_row, grid_shape[0])
+    local_col, col_start, col_end = local_indexes(current_col, grid_shape[1])
 
     ref_patch = reference_indices[row_start:row_end, col_start:col_end].reshape(-1)
     curr_patch = building_indices[row_start:row_end, col_start:col_end].reshape(-1)
@@ -349,7 +349,7 @@ def _encode_single_patch(
         Tuple[int, int, int, int]: (new_row, new_col, codebook_idx, num_bits_encoded)
     """
     context, (local_row, local_col) = build_context_from_patches(
-        reference_indices, building_indices, current_row, current_col, image_shape
+        reference_indices, building_indices, current_row, current_col, grid_shape
     )
 
     selected_idx, encoded_bits = next_patch(
@@ -412,7 +412,7 @@ def encode_message_to_image(
     half_start = image_indices.shape[1] // 20
     building_tensor = image_indices
     building_tensor[:, half_start:] = 0
-    building_tensor = building_tensor.reshape(grid_shape)
+    building_tensor = building_tensor.reshape(grid_shape) # hw
 
     current_row = half_start // grid_shape[1]
     current_col = half_start % grid_shape[1]
@@ -452,10 +452,6 @@ def encode_message_to_image(
                     random_sample=True
                 )
                 pbar.update(1)
-
-    # Restore context region
-    context_patches = DEFAULT_CONTEXT_ROWS // PATCH_SIZE
-    # building_tensor[:context_patches, :] = reference_tensor[:context_patches, :]
 
     # Decode to image
     image = model.decode_to_img(

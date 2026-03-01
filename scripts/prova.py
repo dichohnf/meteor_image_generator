@@ -1,6 +1,14 @@
+import argparse
+import datetime
+import json
+import math
 import os
-import time
+import random
+import sys
+from argparse import ArgumentError, ArgumentParser
+from pathlib import Path
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch.utils.data.dataloader import default_collate
@@ -12,6 +20,7 @@ from tqdm import tqdm, trange
 
 from main import DataModuleFromConfig
 from scripts.encode_message import get_vqgan_sflckr
+from scripts.input import initialized_parser, Options
 
 # Constants
 PATCH_SIZE = 16
@@ -61,7 +70,7 @@ def set_context(model, dsets, num_rows: int) -> Tuple[torch.Tensor, torch.Tensor
     # Validate and adjust num_rows
     if num_rows > image.shape[1]:
         num_rows = image.shape[1]
-        print(f"WARNING: num_rows clamped to image height: {num_rows}")
+        # print(f"WARNING: num_rows clamped to image height: {num_rows}")
 
     # Crop to align with PATCH_SIZE boundaries
     height_crop = image.shape[1] - ((image.shape[1] - num_rows) % PATCH_SIZE)
@@ -326,7 +335,6 @@ def _encode_single_patch(
         building_indices: torch.Tensor,
         current_row: int,
         current_col: int,
-        image_shape: torch.Size,
         grid_shape: Tuple[int, int],
         bits_to_encode: str = "",
         random_sample: bool = False
@@ -373,9 +381,8 @@ def encode_message_to_image(
         message: str,
         model: torch.nn.Module,
         dsets : DataModuleFromConfig,
-        *,
-        random_sample: bool = False,
-        quiet: bool = False
+        random_sample: bool,
+        context_fraction : float
     ) -> torch.Tensor:
     """
     Encodes a text message into a generated image using steganography.
@@ -384,24 +391,22 @@ def encode_message_to_image(
         message: The text message to encode into the image.
         model: The transformer model for prediction.
         dsets: Dataset object containing the reference image.
-        quiet (Optional): Impose to remove all the console outputs.
+        # quiet (Optional): Impose to remove all the console outputs.
         random_sample (Optional): If True, samples randomly without encoding.
 
     Returns:
         torch.Tensor: A generated image tensor (C, H, W) containing the encoded message.
     """
-    if not quiet:
-        print("=" * 40, " ENCODING ", "=" * 40)
     image, cond_tensor = set_context(model, dsets, DEFAULT_CONTEXT_ROWS)
-    if not quiet:
-        show_image(image, plot_title="Original image")
+    # if not quiet:
+    #     show_image(image, plot_title="Original image")
 
-    if not quiet:
-        print(f"Original image dimension: {image.unsqueeze(0).shape}")
+    # if not quiet:
+    #     print(f"Original image dimension: {image.unsqueeze(0).shape}")
     image_translations, image_indices = model.encode_to_z(image.unsqueeze(0))
     cond_translations, cond_indices = model.encode_to_c(cond_tensor)
-    if not quiet:
-        show_image(model.first_stage_model.decode(image_translations).squeeze(), plot_title="Translated image")
+    # if not quiet:
+    #     show_image(model.first_stage_model.decode(image_translations).squeeze(), plot_title="Translated image")
 
     grid_shape = (image_translations.shape[2], image_translations.shape[3])
 
@@ -409,7 +414,7 @@ def encode_message_to_image(
         cond_translations.shape[0], cond_translations.shape[2], cond_translations.shape[3]
     ).squeeze()
 
-    half_start = image_indices.shape[1] // 20
+    half_start = math.floor(image_indices.shape[1] * context_fraction)
     building_tensor = image_indices
     building_tensor[:, half_start:] = 0
     building_tensor = building_tensor.reshape(grid_shape) # hw
@@ -421,14 +426,14 @@ def encode_message_to_image(
     remaining_bits = message_bits
 
     # Encode message bits
-    pbar = tqdm(total=len(remaining_bits), desc="Encoding message", disable=quiet)
+    pbar = tqdm(total=len(remaining_bits), desc="Encoding message", disable=True)
     with pbar:
         while remaining_bits:
             next_bits = remaining_bits[:DEFAULT_PRECISION_BITS]
 
             current_row, current_col, _, encoded_len = _encode_single_patch(
                 model, reference_tensor, building_tensor,
-                current_row, current_col, image.shape, grid_shape,
+                current_row, current_col, grid_shape,
                 bits_to_encode=next_bits, random_sample=random_sample
             )
 
@@ -436,19 +441,19 @@ def encode_message_to_image(
             pbar.update(encoded_len)
 
             if current_row >= grid_shape[0]:
-                if not quiet:
-                    print("Reached the end of the image!")
+                # if not quiet:
+                #     print("Reached the end of the image!")
                 break
 
     # Fill remaining patches with random samples
     if current_row < grid_shape[0]:
         total_remaining = (grid_shape[0] - current_row) * grid_shape[1] - current_col
-        pbar = tqdm(total=total_remaining, desc="Filling remaining patches", disable=quiet)
+        pbar = tqdm(total=total_remaining, desc="Filling remaining patches", disable=True)
         with pbar:
             while current_row < grid_shape[0]:
                 current_row, current_col, _, _ = _encode_single_patch(
                     model, reference_tensor, building_tensor,
-                    current_row, current_col, image.shape, grid_shape,
+                    current_row, current_col, grid_shape,
                     random_sample=True
                 )
                 pbar.update(1)
@@ -462,27 +467,67 @@ def encode_message_to_image(
     return image
 
 
-def save_image(image: torch.Tensor, random:bool):
+def save_image(image: torch.Tensor, file_path : str):
     x_np = ((image.detach().cpu().numpy().transpose(1, 2, 0) + 1.0) * 127.5).clip(0, 255).astype("uint8")
-    Image.fromarray(x_np).save(os.path.join("examples", "half_samples", "meteor" if not random else "random", str(time.time_ns()) + ".png"), "PNG")
+    file_path = Path(file_path + ".png")
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(x_np).save(file_path, "PNG")
 
+def reset_seeds(seed : int):
+    np.random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
 
 def main():
     """Main entry point for message encoding demonstration."""
-    message_to_encode = "Hello world!" * 15
 
-    # TODO: move setup and parsing here to parse output dir
-    quiet = True
-    random_sample = True
+    parser = initialized_parser()
+    args = parser.parse_args()
 
-    print("=" * 30, "Setting up the model", "=" * 30)
-    dsets, model = get_vqgan_sflckr(42)
-    for _ in trange(5):
-        generated_image = encode_message_to_image(message_to_encode, model, dsets, random_sample = random_sample, quiet=quiet)
-        save_image(generated_image, random_sample)
-        if not quiet:
-            show_image(generated_image, plot_title="Generated Image with Encoded Message")
+    options = Options(
+        args.message,
+        args.model_directory,
+        args.context_fraction,
+        quiet=args.quiet,
+        to_gen_number=args.to_gen_number,
+        output_directory_path=args.output_directory,
+        relative_options_file_path=args.relative_options_file,
+        seed=args.seed
+    )
 
+    if os.path.exists(options.output_directory):
+        os.rmdir(options.output_directory)
+    os.makedirs(options.output_directory)
+
+    options.save_as_file()
+
+    if not options.quiet:
+        print("=" * 30, "Setting up the model", "=" * 30, flush=True)
+    dsets, model = get_vqgan_sflckr(options.model_directory_path)
+
+    reset_seeds(options.seed)
+    for i in trange(options.to_gen_number, position=0, leave=True, desc="Random generation", disable=options.quiet):
+        generated_image = encode_message_to_image(
+            options.message,
+            model,dsets,
+            random_sample = True,
+            context_fraction=options.context_fraction
+        )
+        save_image(generated_image, os.path.join(options.output_directory, "random", f"rand_{i:03}"))
+        # if not options.quiet:
+        #     show_image(generated_image, plot_title="Generated using top-k sampling standard method")
+
+    reset_seeds(options.seed)
+    for i in trange(options.to_gen_number,  position=0, leave=True, desc="Meteor generation", disable=options.quiet):
+        generated_image = encode_message_to_image(
+            options.message,
+            model,dsets,
+            random_sample = False,
+            context_fraction=options.context_fraction
+        )
+        save_image(generated_image, os.path.join(options.output_directory, "meteor", f"mete_{i:03}"))
+        # if not options.quiet:
+        #     show_image(generated_image, plot_title="Generated Image with Encoded Message")
 
 if __name__ == '__main__':
     main()

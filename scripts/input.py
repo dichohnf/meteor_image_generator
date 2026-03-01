@@ -1,0 +1,73 @@
+import argparse
+import datetime
+import json
+import os
+import random
+from argparse import ArgumentError, ArgumentParser
+from typing import Optional
+
+
+def initialized_parser() -> ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description='Encode a message into an image using steganography',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument('message', help='The message to encrypt within the generated image')
+    parser.add_argument('-m', '--model_directory',
+                        type=str, required=False, default='logs/2020-11-09T13-31-51_sflckr',
+                        help='Directory where are present the subdirectories \'checkpoint\', \'configs\' and \'samples\' of the model, generally under \'logs\'')
+    parser.add_argument('-c', '--context_fraction',
+                        type=float, required=False, default='0.1',
+                        help='Fraction of the contextual image to use as context')
+    parser.add_argument('-q', '--quiet',
+                        type=bool, required=False, default=False,
+                        help='Impose to remove all the console outputs')
+    parser.add_argument('-o', '--output_directory',
+                        type=str, required=False, default=f'examples{str(datetime.datetime.now())}',
+                        help='Directory where to save the generated image')
+    parser.add_argument('-s', '--seed',
+                        type=Optional[int], required=False, default=None,
+                        help='Seed for the random number generator')
+    parser.add_argument('-n', '--to_gen_number',
+                        type=int, required=False, default=5,
+                        help='Number of generated images to generate')
+    parser.add_argument('-r', '--relative_options_file',
+                        type=str, required=False, default='options.json',
+                        help='Relative path to the options file')
+    return parser
+
+class Options:
+    def __init__(
+        self, message : str,
+        model_directory_path : str,
+        /,
+        context_fraction : float = 1/20.,
+        * ,
+        quiet : bool = False,
+        seed : Optional[int] = None,
+        to_gen_number : int = 5,
+        output_directory_path : Optional[str] = None,
+        relative_options_file_path : Optional[str] = None,
+    ) -> None:
+        if message is None:
+            raise ArgumentError(message, "Message cannot be None")
+        self.message = message
+        if model_directory_path is None:
+            raise ArgumentError(model_directory_path, "Model directory cannot be None")
+        self.model_directory_path = model_directory_path
+
+        self.context_fraction = context_fraction
+
+        self.quiet = quiet
+        self.seed = seed or random.randint(1, 10000)
+        self.to_gen_number = to_gen_number
+        self.output_directory = output_directory_path or os.path.join("examples", str(datetime.datetime.now()))
+        self.relative_options_file_path = relative_options_file_path or "options.json"
+
+    def save_as_file(self) -> None:
+        if not os.path.exists(self.output_directory):
+            os.makedirs(self.output_directory)
+
+        path = os.path.join(self.output_directory, self.relative_options_file_path)
+        with open(path, "x") as file:
+            json.dump(self.__dict__, file, indent=2)

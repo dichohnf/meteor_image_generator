@@ -26,7 +26,7 @@ def initialized_parser() -> ArgumentParser:
                         type=str, required=False, default=f'examples{str(datetime.datetime.now())}',
                         help='Directory where to save the generated image')
     parser.add_argument('-s', '--seed',
-                        type=Optional[int], required=False, default=None,
+                        type=Optional[int], required=False, default=random.randint(1, 10000),
                         help='Seed for the random number generator')
     parser.add_argument('-n', '--to_gen_number',
                         type=int, required=False, default=5,

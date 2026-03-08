@@ -20,20 +20,27 @@ def initialized_parser() -> ArgumentParser:
                         type=float, required=False, default='0.1',
                         help='Fraction of the contextual image to use as context')
     parser.add_argument('-q', '--quiet',
-                        type=bool, required=False, default=False,
+                        action='store_true', required=False, default=False,
                         help='Impose to remove all the console outputs')
     parser.add_argument('-o', '--output_directory',
-                        type=str, required=False, default=f'examples{str(datetime.datetime.now())}',
+                        type=str, required=False, default=None,
                         help='Directory where to save the generated image')
     parser.add_argument('-s', '--seed',
                         type=Optional[int], required=False, default=random.randint(1, 10000),
                         help='Seed for the random number generator')
     parser.add_argument('-n', '--to_gen_number',
-                        type=int, required=False, default=5,
+                        type=int, required=False, default=1,
                         help='Number of generated images to generate')
     parser.add_argument('-r', '--relative_options_file',
-                        type=str, required=False, default='options.json',
+                        type=str, required=False, default=None,
                         help='Relative path to the options file')
+    # Random generation
+    parser.add_argument('--random-generation',
+                        action='store_true',
+                        help='Whatever the code should generate even images with random sampling (top_k)')
+    parser.add_argument('--without-random-generation',
+                        dest='random_generation', action='store_false')
+    parser.set_defaults(random_generation=False)
     return parser
 
 class Options:
@@ -48,6 +55,7 @@ class Options:
         to_gen_number : int = 5,
         output_directory_path : Optional[str] = None,
         relative_options_file_path : Optional[str] = None,
+        random_generation : bool = False,
     ) -> None:
         if message is None:
             raise ArgumentError(message, "Message cannot be None")
@@ -63,6 +71,7 @@ class Options:
         self.to_gen_number = to_gen_number
         self.output_directory = output_directory_path or os.path.join("examples", str(datetime.datetime.now()))
         self.relative_options_file_path = relative_options_file_path or "options.json"
+        self.random_generation = random_generation
 
     def save_as_file(self) -> None:
         if not os.path.exists(self.output_directory):

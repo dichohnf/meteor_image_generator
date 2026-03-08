@@ -8,6 +8,6 @@ setup(
     install_requires=[
         'torch', 'numpy', 'tqdm', 'omegaconf', 'pillow', 'torchvision', 'pytorch-lightning',
         'torchvision', 'pytorch-lightning', 'pytorch-lightning', 'pytorch-lightning', 'einops',
-        'requests'
+        'requests', 'matplotlib'
     ],
 )

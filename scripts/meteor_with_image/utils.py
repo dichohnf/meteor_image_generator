@@ -10,13 +10,72 @@ from PIL import Image
 from matplotlib import pyplot as plt
 from omegaconf import OmegaConf
 from torch import Tensor
+from torch.utils.data.dataloader import default_collate
 
 # Constants
 PATCH_SIZE = 16
 DEFAULT_CODEBOOK_SIZE = 1024
 DEFAULT_PRECISION_BITS = 10
-DEFAULT_CONTEXT_ROWS = 512
+DEFAULT_CONTEXT_ROWS = 0
 LN2 = 0.69315  # ln(2) for entropy calculation
+
+
+def bits2string(binary_str: str, code: str = 'ASCII') -> str:
+    """
+    Decodes a binary string back into its original message using the specified encoding.
+
+    Args:
+        binary_str (str): The binary string to decode.
+        code (str, optional): The encoding scheme used for decoding. Can be 'ASCII',
+                            'UNICODE', or 'DECIMAL'. Defaults to 'ASCII'.
+
+    Returns:
+        str: The decoded message as a string.
+
+    Raises:
+        ValueError: If the length of `binary_str` is not compatible with the specified `code`.
+                     Or if an invalid encoding scheme is provided.
+    """
+
+    encoding_config = {
+        'ASCII': 8,
+        'UNICODE': 21,
+        'DECIMAL': 4
+    }
+
+    if not binary_str.strip():
+        return ''
+
+    # Get the necessary bit width for the given code
+    bit_width = encoding_config.get(code)
+    if not bit_width:
+        raise ValueError(f"Unsupported encoding: {code}. Use 'ASCII', 'UNICODE', or 'DECIMAL'.")
+
+    total_bits = len(binary_str)
+    if total_bits % bit_width != 0:
+        raise ValueError("The binary string length must be divisible by the bit width for the given code.")
+
+    # Split the binary string into chunks of size bit_width
+    bits_per_char = [binary_str[i * bit_width:(i + 1) * bit_width] for i in range(total_bits // bit_width)]
+
+    decoded_message = []
+    for bits in bits_per_char:
+        int_val = int(bits, 2)
+
+        if code == 'ASCII':
+            char = chr(int_val)
+        elif code == 'UNICODE':
+            try:
+                char = chr(int_val)  # Converts binary to Unicode character
+            except ValueError:
+                raise ValueError(f"Invalid Unicode code point: {int_val}")
+        elif code == 'DECIMAL':
+            char = str(int_val)
+
+        decoded_message.append(char)
+
+    return ''.join(decoded_message)
+
 
 def string2bits(message: str, code: str = 'ASCII') -> str:
     """
@@ -157,7 +216,7 @@ def show_image(image: torch.Tensor, *, plot_title: str = "") -> None:
     plt.show()
 
 def save_image(image: torch.Tensor, file_path : str):
-    x_np = ((image.detach().cpu().numpy().transpose(1, 2, 0) + 1.0) * 127.5).clip(0, 255).astype("uint8")
+    x_np = ((image.detach().cpu().numpy() + 1.0) * 127.5).clip(0, 255).astype("uint8").transpose(1, 2, 0)
     file_path = Path(file_path + ".png")
     file_path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(x_np).save(file_path, "PNG")
@@ -259,3 +318,52 @@ def get_vqgan_sflckr(model_directory_path: str, *, quiet: bool = False) -> Tuple
 
     return dsets, model
 
+
+@torch.no_grad()
+def set_context(model, dsets, num_rows: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Prepares and returns a context image from the given dataset.
+
+    Extracts a random image from the dataset, processes it through the model,
+    and crops it to align with 16-pixel patch boundaries.
+
+    Args:
+        model: The model instance with a `get_input` method.
+        dsets: Data structure containing datasets.
+        num_rows: Number of pixel rows to retain from the top of the image.
+
+    Returns:
+        torch.Tensor: A 3D tensor (channels, height, width) representing
+            the prepared context image, cropped to be divisible by 16 pixels.
+
+    Raises:
+        ValueError: If num_rows is None.
+    """
+    if num_rows is None:
+        raise ValueError("num_rows must be not \"None\"")
+
+    # Select dataset
+    if len(dsets.datasets) > 1:
+        split = sorted(dsets.datasets.keys())[0]
+        dset = dsets.datasets[split]
+    else:
+        dset = next(iter(dsets.datasets.values()))
+
+    # Get random image
+    context_idx = torch.randint(len(dset), size=(1,)).item()
+    example = default_collate([dset[context_idx]])
+
+    image = model.get_input("image", example).to(model.device).squeeze()
+    cond_tensor = model.get_input(model.cond_stage_key, example).to(model.device)
+
+    # Validate and adjust num_rows
+    if num_rows > image.shape[1]:
+        num_rows = image.shape[1]
+        # print(f"WARNING: num_rows clamped to image height: {num_rows}")
+
+    # Crop to align with PATCH_SIZE boundaries
+    height_crop = image.shape[1] - ((image.shape[1] - num_rows) % PATCH_SIZE)
+    width_crop = image.shape[2] - (image.shape[2] % PATCH_SIZE)
+    image = image[:, :height_crop, :width_crop]
+
+    return image, cond_tensor

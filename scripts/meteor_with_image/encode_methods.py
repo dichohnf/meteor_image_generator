@@ -2,66 +2,16 @@ import math
 import os
 from typing import Tuple, Optional
 
+import numpy as np
 import torch
 from torch import Tensor
-from torch.utils.data.dataloader import default_collate
 from tqdm.auto import tqdm, trange
 
 from main import DataModuleFromConfig
 from scripts.meteor_with_image.input import Options
 from scripts.meteor_with_image.utils import bits2int, int2bits, count_matching_bits_from_start, local_indexes, \
-    reset_seeds, save_image, string2bits
+    reset_seeds, save_image, string2bits, set_context
 from scripts.meteor_with_image.utils import PATCH_SIZE, DEFAULT_CODEBOOK_SIZE, DEFAULT_PRECISION_BITS, DEFAULT_CONTEXT_ROWS
-
-
-@torch.no_grad()
-def set_context(model, dsets, num_rows: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Prepares and returns a context image from the given dataset.
-
-    Extracts a random image from the dataset, processes it through the model,
-    and crops it to align with 16-pixel patch boundaries.
-
-    Args:
-        model: The model instance with a `get_input` method.
-        dsets: Data structure containing datasets.
-        num_rows: Number of pixel rows to retain from the top of the image.
-
-    Returns:
-        torch.Tensor: A 3D tensor (channels, height, width) representing
-            the prepared context image, cropped to be divisible by 16 pixels.
-
-    Raises:
-        ValueError: If num_rows is None.
-    """
-    if num_rows is None:
-        raise ValueError("num_rows must be not None")
-
-    # Select dataset
-    if len(dsets.datasets) > 1:
-        split = sorted(dsets.datasets.keys())[0]
-        dset = dsets.datasets[split]
-    else:
-        dset = next(iter(dsets.datasets.values()))
-
-    # Get random image
-    context_idx = torch.randint(len(dset), size=(1,)).item()
-    example = default_collate([dset[context_idx]])
-
-    image = model.get_input("image", example).to(model.device).squeeze()
-    cond_tensor = model.get_input(model.cond_stage_key, example).to(model.device)
-
-    # Validate and adjust num_rows
-    if num_rows > image.shape[1]:
-        num_rows = image.shape[1]
-        # print(f"WARNING: num_rows clamped to image height: {num_rows}")
-
-    # Crop to align with PATCH_SIZE boundaries
-    height_crop = image.shape[1] - ((image.shape[1] - num_rows) % PATCH_SIZE)
-    width_crop = image.shape[2] - (image.shape[2] % PATCH_SIZE)
-    image = image[:, :height_crop, :width_crop]
-
-    return image, cond_tensor
 
 
 @torch.no_grad()
@@ -311,3 +261,6 @@ def images_generation(
         )
         path = os.path.join(options.output_directory, "random" if random_generation else "meteor", f"rand_{i:03}")
         save_image(generated_image, path)
+        arr = generated_image.detach().cpu().numpy()
+        with open(path + "_encoded.txt", "x") as f:
+            f.write(np.array2string(arr))

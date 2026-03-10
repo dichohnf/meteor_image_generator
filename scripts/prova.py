@@ -1,4 +1,8 @@
 import os
+import shutil
+import sys
+
+import numpy as np
 
 from scripts.meteor_with_image.decode_methods import load_image, decode_message
 from scripts.meteor_with_image.encode_methods import images_generation
@@ -24,7 +28,7 @@ def main():
     )
 
     if os.path.exists(options.output_directory):
-        os.rmdir(options.output_directory)
+        shutil.rmtree(options.output_directory)
     os.makedirs(options.output_directory)
 
     options.save_as_file()
@@ -43,9 +47,16 @@ def main():
         raise Exception("No meteor generated image founded")
 
     reset_seeds(options.seed)
-    for _,_,image_path in os.walk(meteor_path):
-        image = load_image(image_path)
-        decoded_message = decode_message(options, model, dsets, image)
+    for root, _, filenames in os.walk(meteor_path):
+        for filename in filenames:
+            if not filename.lower().endswith((".png", ".jpg", ".jpeg")):
+                continue
+            image_path = os.path.join(root, filename)
+            image = load_image(image_path)
+            arr = image.detach().cpu().numpy()
+            with open(image_path + "_decoded.txt", "x") as f:
+                f.write(np.array2string(arr))
+            decoded_message = decode_message(options, model, dsets, image)
 
 
 if __name__ == '__main__':

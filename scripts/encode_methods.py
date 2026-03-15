@@ -8,10 +8,10 @@ from torch import Tensor
 from tqdm.auto import tqdm, trange
 
 from main import DataModuleFromConfig
-from scripts.meteor_with_image.input import Options
-from scripts.meteor_with_image.utils import bits2int, int2bits, count_matching_bits_from_start, local_indexes, \
+from scripts.input import Options
+from scripts.utils import bits2int, int2bits, count_matching_bits_from_start, local_indexes, \
     reset_seeds, save_image, string2bits, set_context
-from scripts.meteor_with_image.utils import PATCH_SIZE, DEFAULT_CODEBOOK_SIZE, DEFAULT_PRECISION_BITS, DEFAULT_CONTEXT_ROWS
+from scripts.utils import PATCH_SIZE, DEFAULT_CODEBOOK_SIZE, DEFAULT_PRECISION_BITS, DEFAULT_CONTEXT_ROWS
 
 
 @torch.no_grad()

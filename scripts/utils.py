@@ -11,6 +11,7 @@ from matplotlib import pyplot as plt
 from omegaconf import OmegaConf
 from torch import Tensor
 from torch.utils.data.dataloader import default_collate
+from torchvision.io import write_png
 
 # Constants
 PATCH_SIZE = 16
@@ -52,8 +53,13 @@ def bits2string(binary_str: str, code: str = 'ASCII') -> str:
         raise ValueError(f"Unsupported encoding: {code}. Use 'ASCII', 'UNICODE', or 'DECIMAL'.")
 
     total_bits = len(binary_str)
-    if total_bits % bit_width != 0:
-        raise ValueError("The binary string length must be divisible by the bit width for the given code.")
+
+    # Split the binary string into chunks of size bit_width
+    # This automatically ignores trailing bits that don't make a full character
+    bits_per_char = [
+        binary_str[i * bit_width:(i + 1) * bit_width]
+        for i in range(total_bits // bit_width)
+    ]
 
     # Split the binary string into chunks of size bit_width
     bits_per_char = [binary_str[i * bit_width:(i + 1) * bit_width] for i in range(total_bits // bit_width)]
@@ -68,7 +74,7 @@ def bits2string(binary_str: str, code: str = 'ASCII') -> str:
             try:
                 char = chr(int_val)  # Converts binary to Unicode character
             except ValueError:
-                raise ValueError(f"Invalid Unicode code point: {int_val}")
+                continue
         elif code == 'DECIMAL':
             char = str(int_val)
 
@@ -216,10 +222,15 @@ def show_image(image: torch.Tensor, *, plot_title: str = "") -> None:
     plt.show()
 
 def save_image(image: torch.Tensor, file_path : str):
-    x_np = ((image.detach().cpu().numpy() + 1.0) * 127.5).clip(0, 255).astype("uint8").transpose(1, 2, 0)
-    file_path = Path(file_path + ".png")
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(x_np).save(file_path, "PNG")
+    # x_np = ((image.detach().cpu().numpy() + 1.0) * 127.5).clip(0, 255).astype("uint8").transpose(1, 2, 0)
+    # file_path = Path(file_path + ".png")
+    # file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path += ".png"
+    parent = Path(file_path).parent
+    if not parent.exists():
+        parent.mkdir(parents=True)
+    write_png(((image.detach().cpu() + 1.0) * 127.5).clip(0, 255).type(torch.u), file_path, 0)
+    # Image.fromarray(x_np).save(file_path, "PNG")
 
 def reset_seeds(seed : int):
     np.random.seed(seed)

@@ -1,13 +1,12 @@
 import os
 import shutil
-import sys
 
 import numpy as np
 
-from scripts.meteor_with_image.decode_methods import load_image, decode_message
-from scripts.meteor_with_image.encode_methods import images_generation
-from scripts.meteor_with_image.input import initialized_parser, Options
-from scripts.meteor_with_image.utils import reset_seeds, get_vqgan_sflckr
+from scripts.decode_methods import load_image, decode_message
+from scripts.encode_methods import images_generation
+from scripts.input import initialized_parser, Options
+from scripts.utils import reset_seeds, get_vqgan_sflckr
 
 def main():
     """Main entry point for message encoding demonstration."""
@@ -57,6 +56,9 @@ def main():
             with open(image_path + "_decoded.txt", "x") as f:
                 f.write(np.array2string(arr))
             decoded_message = decode_message(options, model, dsets, image)
+            with open(image_path + "_decoded_message.txt", "x") as f:
+                f.write(decoded_message)
+
 
 
 if __name__ == '__main__':

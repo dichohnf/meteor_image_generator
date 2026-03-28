@@ -2,11 +2,14 @@ import os
 import shutil
 
 import numpy as np
+import torch
 
-from scripts.decode_methods import load_image, decode_message
+from scripts.logger import logger
+from scripts.decode_methods import decode_message, load_image
 from scripts.encode_methods import images_generation
-from scripts.input import initialized_parser, Options
-from scripts.utils import reset_seeds, get_vqgan_sflckr
+from scripts.input import Options, initialized_parser
+from scripts.utils import get_vqgan_sflckr, reset_seeds
+
 
 def main():
     """Main entry point for message encoding demonstration."""
@@ -31,35 +34,43 @@ def main():
     os.makedirs(options.output_directory)
 
     options.save_as_file()
+    logger.enable_set(not options.quiet)
 
-    if not options.quiet:
-        print("=" * 30, "Setting up the model", "=" * 30, flush=True)
+    logger.info("Options saved to file.")
+    logger.info("SETTING UP VQGAN MODEL AND DATASETS...")
     dsets, model = get_vqgan_sflckr(options.model_directory_path)
+    logger.info("VQGAN MODEL AND DATASETS SETUP COMPLETED.")
 
+    logger.info("Starting image generation...")
     if options.random_generation:
+        logger.info("Random generation enabled. Generating random images without encoding messages.")
         images_generation(options, model, dsets, True)
-
+        
+    logger.info("Starting message encoding into images...")
     images_generation(options, model, dsets, False)
 
     meteor_path = os.path.join(options.output_directory, "meteor")
     if not os.path.exists(meteor_path) or not os.path.isdir(meteor_path):
-        raise Exception("No meteor generated image founded")
+        logger.error(f"Meteor path '{meteor_path}' does not exist or is not a directory.")
+        return
 
     reset_seeds(options.seed)
+    logger.info("Starting message decoding from generated images...")
     for root, _, filenames in os.walk(meteor_path):
         for filename in filenames:
             if not filename.lower().endswith((".png", ".jpg", ".jpeg")):
                 continue
             image_path = os.path.join(root, filename)
             image = load_image(image_path)
-            arr = image.detach().cpu().numpy()
-            with open(image_path + "_decoded.txt", "x") as f:
-                f.write(np.array2string(arr))
-            decoded_message = decode_message(options, model, dsets, image)
-            with open(image_path + "_decoded_message.txt", "x") as f:
-                f.write(decoded_message)
-
-
-
+            # arr = image.detach().cpu().numpy()
+            _, bits_string, selected_indices = decode_message(options, model, dsets, image)
+            
+            image_name = os.path.splitext(os.path.basename(image_path))[0]
+            with open(root + "/" + image_name + "_decoded_bits.txt", "x") as f:
+                f.write(bits_string)
+            with open(root + "/" + image_name + "_decoded_indices.txt", "x") as f:
+                f.write(np.array2string(np.array(selected_indices), suppress_small=True))
+                
 if __name__ == '__main__':
+    torch.set_printoptions(profile="full")
     main()

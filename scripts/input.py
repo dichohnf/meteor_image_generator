@@ -17,7 +17,7 @@ def initialized_parser() -> ArgumentParser:
                         type=str, required=False, default='logs/2020-11-09T13-31-51_sflckr',
                         help='Directory where are present the subdirectories \'checkpoint\', \'configs\' and \'samples\' of the model, generally under \'logs\'')
     parser.add_argument('-c', '--context_fraction',
-                        type=float, required=False, default='0.1',
+                        type=float, required=False, default=0.1,
                         help='Fraction of the contextual image to use as context')
     parser.add_argument('-q', '--quiet',
                         action='store_true', required=False, default=False,
@@ -26,7 +26,7 @@ def initialized_parser() -> ArgumentParser:
                         type=str, required=False, default=None,
                         help='Directory where to save the generated image')
     parser.add_argument('-s', '--seed',
-                        type=Optional[int], required=False, default=random.randint(1, 10000),
+                        type=int, required=False, default=random.randint(1, 10000),
                         help='Seed for the random number generator')
     parser.add_argument('-n', '--to_gen_number',
                         type=int, required=False, default=1,
@@ -67,7 +67,7 @@ class Options:
         self.context_fraction = context_fraction
 
         self.quiet = quiet
-        self.seed = seed or random.randint(1, 10000)
+        self.seed = seed if seed is not None else random.randint(1, 10000)
         self.to_gen_number = to_gen_number
         self.output_directory = output_directory_path or os.path.join("examples", str(datetime.datetime.now()))
         self.relative_options_file_path = relative_options_file_path or "options.json"

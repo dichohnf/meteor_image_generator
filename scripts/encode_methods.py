@@ -1,6 +1,6 @@
 import math
 import os
-from typing import Tuple, Optional
+from typing import List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -9,9 +9,10 @@ from tqdm.auto import tqdm, trange
 
 from main import DataModuleFromConfig
 from scripts.input import Options
-from scripts.utils import bits2int, int2bits, count_matching_bits_from_start, local_indexes, \
+from scripts.utils import bits2int, build_context_from_patches, int2bits, count_matching_bits_from_start, local_indexes, \
     reset_seeds, save_image, string2bits, set_context
 from scripts.utils import PATCH_SIZE, DEFAULT_CODEBOOK_SIZE, DEFAULT_PRECISION_BITS, DEFAULT_CONTEXT_ROWS
+from scripts.logger import logger
 
 
 @torch.no_grad()
@@ -73,48 +74,20 @@ def next_patch(
     cumulative_probs += codebook_len - cumulative_probs[-1]
 
     # Select based on message bits
-    message_idx = bits2int(message_bits, reversed=True)
+    message_bits = (message_bits + "0" * DEFAULT_PRECISION_BITS)[:DEFAULT_PRECISION_BITS]
+    message_idx = bits2int(message_bits)
     selection = torch.nonzero(cumulative_probs > message_idx)[0].item()
 
     # Calculate encoded bit range
     range_bottom = cumulative_probs[selection - 1].item() if selection > 0 else 0
     range_top = cumulative_probs[selection].item()
 
-    bottom_bits = list(reversed(int2bits(range_bottom, DEFAULT_PRECISION_BITS)))
-    top_bits = list(reversed(int2bits(range_top - 1, DEFAULT_PRECISION_BITS)))
+    bottom_bits = int2bits(range_bottom, DEFAULT_PRECISION_BITS)
+    top_bits = int2bits(range_top - 1, DEFAULT_PRECISION_BITS)
 
     num_bits_encoded = count_matching_bits_from_start(bottom_bits, top_bits)
 
     return indices[selection].item(), num_bits_encoded
-
-def build_context_from_patches(
-        reference_indices: torch.Tensor,
-        building_indices: torch.Tensor,
-        current_row: int,
-        current_col: int,
-        grid_shape: Tuple[int, int]
-) -> Tuple[Tensor, Tuple[int, int]]:
-    """
-    Builds a context tensor by concatenating reference and current patch sequences.
-
-    Args:
-        reference_indices: Reference codebook indices from context image.
-        building_indices: Current generated codebook indices.
-        current_row: Current row position in the patch grid.
-        current_col: Current column position in the patch grid.
-        grid_shape: Shape of the patch translation.
-
-    Returns:
-        Tuple[Tensor, Tuple[int, int]]: (context_tensor, (local_row, local_col))
-    """
-    local_row, row_start, row_end = local_indexes(current_row, grid_shape[0])
-    local_col, col_start, col_end = local_indexes(current_col, grid_shape[1])
-
-    ref_patch = reference_indices[row_start:row_end, col_start:col_end].reshape(-1)
-    curr_patch = building_indices[row_start:row_end, col_start:col_end].reshape(-1)
-    context = torch.cat((ref_patch, curr_patch), dim=0)
-
-    return context, (local_row, local_col)
 
 def _encode_single_patch(
         model: torch.nn.Module,
@@ -170,7 +143,7 @@ def encode_message_to_image(
         dsets : DataModuleFromConfig,
         random_sample: bool,
         context_fraction : float
-    ) -> torch.Tensor:
+) -> Tuple[torch.Tensor, str, List[int]]:
     """
     Encodes a text message into a generated image using steganography.
 
@@ -205,6 +178,7 @@ def encode_message_to_image(
 
     message_bits = string2bits(message)
     remaining_bits = message_bits
+    indices_sequence = []
 
     # Encode message bits
     pbar = tqdm(total=len(remaining_bits), desc="Encoding message", disable=True)
@@ -212,11 +186,12 @@ def encode_message_to_image(
         while remaining_bits:
             next_bits = remaining_bits[:DEFAULT_PRECISION_BITS]
 
-            current_row, current_col, _, encoded_len = _encode_single_patch(
+            current_row, current_col, selected_idx, encoded_len = _encode_single_patch(
                 model, reference_tensor, building_tensor,
                 current_row, current_col, grid_shape,
                 bits_to_encode=next_bits, random_sample=random_sample
             )
+            indices_sequence.append(selected_idx)
 
             remaining_bits = remaining_bits[encoded_len:]
             pbar.update(encoded_len)
@@ -230,20 +205,27 @@ def encode_message_to_image(
         pbar = tqdm(total=total_remaining, desc="Filling remaining patches", disable=True)
         with pbar:
             while current_row < grid_shape[0]:
-                current_row, current_col, _, _ = _encode_single_patch(
+                current_row, current_col, selected_idx, _ = _encode_single_patch(
                     model, reference_tensor, building_tensor,
                     current_row, current_col, grid_shape,
                     random_sample=True
                 )
                 pbar.update(1)
+                indices_sequence.append(selected_idx)
 
     # Decode to image
+    sampled_indices = building_tensor[:grid_shape[0], :grid_shape[1]].reshape(-1)
+    logger.info(f"Sampled image indices shape: {sampled_indices.shape}, min: {sampled_indices.min()}, max: {sampled_indices.max()}, sample: {sampled_indices[:10].tolist()}")
+    logger.info(f"Shape of building tensor: {building_tensor.shape}")
+    
     image = model.decode_to_img(
-        building_tensor[:grid_shape[0], :grid_shape[1]].unsqueeze(0),
+        building_tensor.unsqueeze(0),
         image_translations.shape,
     ).squeeze()
+    
+    # logger.info(f"Sampled image indices: {model.encode_to_z(image.unsqueeze(0))[1].squeeze()}")
 
-    return image
+    return image, message_bits, indices_sequence, building_tensor
 
 def images_generation(
         options: Options,
@@ -251,16 +233,22 @@ def images_generation(
         dsets: DataModuleFromConfig,
         random_generation: bool
 ) -> None:
+    logger.info(f"Random seed: {options.seed}")
     reset_seeds(options.seed)
-    for i in trange(options.to_gen_number, position=0, leave=True, desc="Random generation" if random_generation else "Meteor generation", disable=options.quiet):
-        generated_image = encode_message_to_image(
+    for i in range(options.to_gen_number):
+        logger.info(f"Generating image {i+1}/{options.to_gen_number} {'(random image)' if random_generation else '(encoding message)'}...")
+        
+        generated_image, bits_string, indices_sequence, building_tensor = encode_message_to_image(
             options.message,
             model, dsets,
-            random_sample=True,
+            random_sample=random_generation,
             context_fraction=options.context_fraction
         )
         path = os.path.join(options.output_directory, "random" if random_generation else "meteor", f"rand_{i:03}")
         save_image(generated_image, path)
+        logger.info(f"Image saved to {path}.png")
         arr = generated_image.detach().cpu().numpy()
-        with open(path + "_encoded.txt", "x") as f:
-            f.write(np.array2string(arr))
+        with open(path + "_encoded_bits.txt", "x") as f:
+            f.write(bits_string)
+        with open(path + "_encoded_indices.txt", "x") as f:
+            f.write(np.array2string(np.array(indices_sequence), suppress_small=True))

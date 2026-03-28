@@ -133,9 +133,9 @@ def bits2int(bits: str, *, reversed: bool = False) -> int:
     """
     return int(bits[::-1] if reversed else bits, 2)
 
-def int2bits(value: int, num_bits: int) -> List[int]:
+def int2bits(value: int, num_bits: int) -> str:
     """
-    Converts an integer to a reversed list of binary digits.
+    Converts an integer to a list of binary digits.
 
     Args:
         value: The integer value to convert.
@@ -145,10 +145,10 @@ def int2bits(value: int, num_bits: int) -> List[int]:
         List[int]: Binary digits in reversed order (LSB first).
     """
     if num_bits == 0:
-        return []
+        return ""
 
-    binary_str = format(value, f'0{num_bits}b')
-    return [int(bit) for bit in reversed(binary_str)]
+    return format(value, f'0{num_bits}b')
+    
 
 def local_indexes(index: int, max_len: int) -> Tuple[int, int, int]:
     """
@@ -188,7 +188,7 @@ def entropy(q: Tensor, logq: Tensor) -> float:
     res[q == 0] = 0
     return -res.sum().item()
 
-def count_matching_bits_from_start(bits1: List[int], bits2: List[int]) -> int:
+def count_matching_bits_from_start(bits1: str, bits2: str) -> int:
     """
     Counts consecutive matching bits from the beginning of two sequences.
 
@@ -229,7 +229,7 @@ def save_image(image: torch.Tensor, file_path : str):
     parent = Path(file_path).parent
     if not parent.exists():
         parent.mkdir(parents=True)
-    write_png(((image.detach().cpu() + 1.0) * 127.5).clip(0, 255).type(torch.u), file_path, 0)
+    write_png(((image.detach().cpu() + 1.0) * 127.5).clip(0, 255).type(torch.uint8), file_path, 0)
     # Image.fromarray(x_np).save(file_path, "PNG")
 
 def reset_seeds(seed : int):
@@ -304,6 +304,7 @@ def load_model_and_dset(config, ckpt, gpu, eval_mode):
 
 def get_vqgan_sflckr(model_directory_path: str, *, quiet: bool = False) -> Tuple[Any, Any]:
     if not os.path.exists(model_directory_path):
+        logger.error(f"Cannot find {model_directory_path}")
         raise ValueError(f"Cannot find {model_directory_path}")
     if os.path.isfile(model_directory_path):
         paths = model_directory_path.split("/")
@@ -378,3 +379,32 @@ def set_context(model, dsets, num_rows: int) -> Tuple[torch.Tensor, torch.Tensor
     image = image[:, :height_crop, :width_crop]
 
     return image, cond_tensor
+
+def build_context_from_patches(
+        reference_indices: torch.Tensor,
+        building_indices: torch.Tensor,
+        current_row: int,
+        current_col: int,
+        grid_shape: Tuple[int, int]
+) -> Tuple[Tensor, Tuple[int, int]]:
+    """
+    Builds a context tensor by concatenating reference and current patch sequences.
+
+    Args:
+        reference_indices: Reference codebook indices from context image.
+        building_indices: Current generated codebook indices.
+        current_row: Current row position in the patch grid.
+        current_col: Current column position in the patch grid.
+        grid_shape: Shape of the patch translation.
+
+    Returns:
+        Tuple[Tensor, Tuple[int, int]]: (context_tensor, (local_row, local_col))
+    """
+    local_row, row_start, row_end = local_indexes(current_row, grid_shape[0])
+    local_col, col_start, col_end = local_indexes(current_col, grid_shape[1])
+
+    ref_patch = reference_indices[row_start:row_end, col_start:col_end].reshape(-1)
+    curr_patch = building_indices[row_start:row_end, col_start:col_end].reshape(-1)
+    context = torch.cat((ref_patch, curr_patch), dim=0)
+
+    return context, (local_row, local_col)

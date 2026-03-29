@@ -5,250 +5,276 @@ from typing import List, Tuple, Optional
 import numpy as np
 import torch
 from torch import Tensor
-from tqdm.auto import tqdm, trange
+from tqdm.auto import tqdm
 
 from main import DataModuleFromConfig
 from scripts.input import Options
-from scripts.utils import bits2int, build_context_from_patches, int2bits, count_matching_bits_from_start, local_indexes, \
+from scripts.utils import bits2int, build_context_from_patches, int2bits, count_matching_bits_from_start, \
     reset_seeds, save_image, string2bits, set_context
 from scripts.utils import PATCH_SIZE, DEFAULT_CODEBOOK_SIZE, DEFAULT_PRECISION_BITS, DEFAULT_CONTEXT_ROWS
 from scripts.logger import logger
+from scripts.stats import EncodingStatistics
 
 
-@torch.no_grad()
-def next_patch(
-        model: torch.nn.Module,
-        context: torch.Tensor,
-        message_bits: str,
-        position: Tuple[int, int],
-        *,
-        codebook_len: int = DEFAULT_CODEBOOK_SIZE,
-        random_sample: bool = False,
-        top_k: Optional[int] = None,
-) -> Tuple[int, int]:
+class SteganographyEncoder:
     """
-    Generates the next patch token using arithmetic coding for steganography.
-
-    Args:
-        model: The transformer model for prediction.
-        context: Context tensor containing previous patches.
-        message_bits: Binary string of message bits to encode.
-        position: The (row, col) position within the patch grid.
-        codebook_len: Size of the codebook (vocabulary size).
-        random_sample: If True, samples randomly without encoding.
-        top_k: Maximum number of top probable tokens to consider.
-
-    Returns:
-        Tuple[int, int]: (selected_codebook_index, num_bits_encoded)
+    Handles the encoding of secret messages into images using arithmetic coding and VQGAN.
+    This class manages the process of selecting appropriate codebook tokens for each image patch
+    to embed message bits while maintaining visual fidelity.
     """
-    top_k = top_k or codebook_len
-    model.eval()
 
-    # Get logits from model
-    logits, _ = model.transformer(context[:-1].unsqueeze(0))
-    logits = logits[:, -256:, :].squeeze()
-    logits = logits.reshape(PATCH_SIZE, PATCH_SIZE, -1)
-    logits = logits[position[0], position[1], :].double()
+    def __init__(self, model: torch.nn.Module, dsets: DataModuleFromConfig, context_fraction: float = DEFAULT_CONTEXT_ROWS):
+        """
+        Initializes the encoder with the VQGAN model, dataset, and context fraction.
 
-    # Sort and get probabilities
-    logits, indices = logits.sort(descending=True)
-    probs = torch.nn.functional.softmax(logits, dim=-1)
+        Args:
+            model: The trained VQGAN transformer model for generating image patches.
+            dsets: The dataset configuration containing reference images.
+            context_fraction: Fraction of the image used as context for generation.
+        """
+        self.model = model
+        self.dsets = dsets
+        self.context_fraction = context_fraction
 
-    if random_sample:
-        selection = torch.multinomial(probs, 1).item()
-        return indices[selection].item(), 10
+    @torch.no_grad()
+    def select_token_for_patch(
+            self,
+            context: torch.Tensor,
+            message_bits: str,
+            position: Tuple[int, int],
+            *,
+            codebook_len: int = DEFAULT_CODEBOOK_SIZE,
+            random_sample: bool = False,
+            top_k: Optional[int] = None,
+    ) -> Tuple[int, int, int, int, str]:
+        """
+        Selects the optimal codebook token for a specific patch position to encode message bits
+        using arithmetic coding. If random sampling is enabled, selects randomly without encoding.
 
-    # Apply probability threshold
-    prob_threshold = 1 / codebook_len
-    k = min(max(2, torch.nonzero(probs < prob_threshold)[0].item()), top_k)
-    probs_int = probs[:k]
+        Args:
+            context: Tensor representing the context from previous patches.
+            message_bits: Binary string of bits to encode in this patch.
+            position: (row, col) position within the patch grid.
+            codebook_len: Size of the codebook (vocabulary size).
+            random_sample: If True, samples randomly without embedding message.
+            top_k: Maximum number of top probable tokens to consider.
 
-    # Convert probabilities to integer representation for arithmetic coding
-    probs_int = (probs_int / probs_int.sum() * codebook_len).round().long()
-    cumulative_probs = probs_int.cumsum(0)
+        Returns:
+            Tuple of (selected_codebook_index, number_of_bits_encoded, range_bottom, range_top, encoded_bits_binary).
+        """
+        top_k = top_k or codebook_len
+        self.model.eval()
 
-    # Adjust for rounding errors
-    overfill_index = torch.nonzero(cumulative_probs > codebook_len)
-    if len(overfill_index) > 0:
-        cumulative_probs = cumulative_probs[:overfill_index[0]]
-    cumulative_probs += codebook_len - cumulative_probs[-1]
+        logits, _ = self.model.transformer(context[:-1].unsqueeze(0))
+        logits = logits[:, -256:, :].squeeze()
+        logits = logits.reshape(PATCH_SIZE, PATCH_SIZE, -1)
+        logits = logits[position[0], position[1], :].double()
 
-    # Select based on message bits
-    message_bits = (message_bits + "0" * DEFAULT_PRECISION_BITS)[:DEFAULT_PRECISION_BITS]
-    message_idx = bits2int(message_bits)
-    selection = torch.nonzero(cumulative_probs > message_idx)[0].item()
+        logits, indices = logits.sort(descending=True)
+        probs = torch.nn.functional.softmax(logits, dim=-1)
 
-    # Calculate encoded bit range
-    range_bottom = cumulative_probs[selection - 1].item() if selection > 0 else 0
-    range_top = cumulative_probs[selection].item()
+        if random_sample:
+            selected = torch.multinomial(probs, 1).item()
+            encoded_bits_str = format(0, f'0{DEFAULT_PRECISION_BITS}b')
+            # For random sampling, use full range [0, codebook_len)
+            return indices[selected].item(), DEFAULT_PRECISION_BITS, 0, codebook_len, encoded_bits_str
 
-    bottom_bits = int2bits(range_bottom, DEFAULT_PRECISION_BITS)
-    top_bits = int2bits(range_top - 1, DEFAULT_PRECISION_BITS)
+        prob_threshold = 1 / codebook_len
+        k = min(max(2, torch.nonzero(probs < prob_threshold)[0].item()), top_k)
+        probs_int = probs[:k]
 
-    num_bits_encoded = count_matching_bits_from_start(bottom_bits, top_bits)
+        probs_int = (probs_int / probs_int.sum() * codebook_len).round().long()
+        cumulative_probs = probs_int.cumsum(0)
 
-    return indices[selection].item(), num_bits_encoded
+        overfill_indices = torch.nonzero(cumulative_probs > codebook_len)
+        if len(overfill_indices) > 0:
+            cumulative_probs = cumulative_probs[:overfill_indices[0]]
+        cumulative_probs += codebook_len - cumulative_probs[-1]
 
-def _encode_single_patch(
-        model: torch.nn.Module,
-        reference_indices: torch.Tensor,
-        building_indices: torch.Tensor,
-        current_row: int,
-        current_col: int,
-        grid_shape: Tuple[int, int],
-        bits_to_encode: str = "",
-        random_sample: bool = False
-) -> Tuple[int, int, int, int]:
-    """
-    Encodes a single patch position and advances to the next position.
+        message_str = (message_bits + "0" * DEFAULT_PRECISION_BITS)[:DEFAULT_PRECISION_BITS]
+        message_value = bits2int(message_str)
+        selection = torch.nonzero(cumulative_probs > message_value)[0].item()
 
-    Args:
-        model: The transformer model for prediction.
-        reference_indices: Reference codebook indices tensor.
-        building_indices: Building codebook indices tensor (modified in-place).
-        current_row: Current row position in the patch grid.
-        current_col: Current column position in the patch grid.
-        image_shape: Shape of the original image tensor.
-        grid_shape: Grid dimensions (height, width) in patches.
-        bits_to_encode: Binary string of message bits to encode.
-        random_sample: If True, samples randomly without encoding.
+        range_bottom = cumulative_probs[selection - 1].item() if selection > 0 else 0
+        range_top = cumulative_probs[selection].item()
 
-    Returns:
-        Tuple[int, int, int, int]: (new_row, new_col, codebook_idx, num_bits_encoded)
-    """
-    context, (local_row, local_col) = build_context_from_patches(
-        reference_indices, building_indices, current_row, current_col, grid_shape
-    )
+        bottom_bits = int2bits(range_bottom, DEFAULT_PRECISION_BITS)
+        top_bits = int2bits(range_top - 1, DEFAULT_PRECISION_BITS)
 
-    selected_idx, encoded_bits = next_patch(
-        model, context, bits_to_encode, (local_row, local_col), random_sample=random_sample
-    )
+        encoded_bits = count_matching_bits_from_start(bottom_bits, top_bits)
+        encoded_bits_str = bottom_bits[:encoded_bits]
 
-    building_indices[current_row, current_col] = selected_idx
+        return indices[selection].item(), encoded_bits, range_bottom, range_top, encoded_bits_str
 
-    # Advance to next position (raster order)
-    new_col = current_col + 1
-    new_row = current_row
+    @torch.no_grad()
+    def encode_patch(
+            self,
+            reference_indices: torch.Tensor,
+            building_indices: torch.Tensor,
+            current_row: int,
+            current_col: int,
+            grid_shape: Tuple[int, int],
+            image_translations_shape: Tuple[int, int, int, int],
+            bits_to_encode: str = "",
+            random_sample: bool = False,
+    ) -> Tuple[int, int, int, int, int, int, str]:
+        """
+        Encodes a single patch at the given position by selecting an appropriate token
+        and updating the building indices tensor. Advances to the next patch position.
 
-    if new_col >= grid_shape[1]:
-        new_col = 0
-        new_row += 1
+        Args:
+            reference_indices: Reference codebook indices from the context image.
+            building_indices: Current indices being built for the output image.
+            current_row: Current row in the patch grid.
+            current_col: Current column in the patch grid.
+            grid_shape: Dimensions of the patch grid (height, width).
+            image_translations_shape: Shape of the image translations tensor for decoding.
+            bits_to_encode: Binary string to embed in this patch.
+            random_sample: If True, selects token randomly without encoding.
 
-    return new_row, new_col, selected_idx, encoded_bits
+        Returns:
+            Tuple of (next_row, next_col, selected_index, bits_encoded, range_bottom, range_top, encoded_bits_str).
+        """
+        context, (local_row, local_col) = build_context_from_patches(
+            reference_indices, building_indices, current_row, current_col, grid_shape
+        )
+
+        count = 0
+        while True:
+            count += 1
+            if count > 100:  # Prevent infinite loops
+                logger.warning(f"Exceeded maximum attempts to encode patch at ({current_row}, {current_col}). Proceeding with last selection.")
+                selected_idx = building_indices[current_row, current_col].item()
+                encoded_length = 0
+                range_bottom, range_top = 0, DEFAULT_CODEBOOK_SIZE
+                encoded_bits_str = ""
+                break
+
+            selected_idx, encoded_length, range_bottom, range_top, encoded_bits_str = self.select_token_for_patch(
+                context,
+                bits_to_encode,
+                (local_row, local_col),
+                random_sample=random_sample,
+            )
+            building_indices[current_row, current_col] = selected_idx
+
+            exit_condition = random_sample or \
+                self.model.encode_to_z(
+                    self.model.decode_to_img(
+                        building_indices.unsqueeze(0),
+                        image_translations_shape)
+                )[1].squeeze().reshape(grid_shape)[current_row, current_col].item() \
+                == selected_idx
+        
+            if exit_condition:
+                break
+
+        next_col = current_col + 1
+        next_row = current_row
+        if next_col >= grid_shape[1]:
+            next_col = 0
+            next_row += 1
+
+        return next_row, next_col, selected_idx, encoded_length, range_bottom, range_top, encoded_bits_str
+
+    @torch.no_grad()
+    def encode_message_to_image(self, message: str, random_sample: bool = False) -> Tuple[torch.Tensor, str, List[int], torch.Tensor, EncodingStatistics]:
+        """
+        Encodes a text message into a generated image tensor using steganography.
+        Processes the message bit by bit, embedding it into the image patches.
+        Also collects and returns detailed statistics about the encoding process.
+
+        Args:
+            message: The text message to hide in the image.
+            random_sample: If True, generates a random image without embedding the message.
+
+        Returns:
+            Tuple of (generated_image, encoded_bits_string, indices_sequence, building_tensor, encoding_statistics).
+        """
+        source_image, cond_tensor = set_context(self.model, self.dsets, DEFAULT_CONTEXT_ROWS)
+        image_translations, image_indices = self.model.encode_to_z(source_image.unsqueeze(0))
+        cond_translations, cond_indices = self.model.encode_to_c(cond_tensor)
+
+        grid_shape = (image_translations.shape[2], image_translations.shape[3])
+        reference_tensor = cond_indices.reshape(cond_translations.shape[0], cond_translations.shape[2], cond_translations.shape[3]).squeeze()
+
+        half_start = math.floor(image_indices.shape[1] * self.context_fraction)
+        building_tensor = image_indices.clone()
+        building_tensor[:, half_start:] = 0
+        building_tensor = building_tensor.reshape(grid_shape)
+
+        current_row = half_start // grid_shape[1]
+        current_col = half_start % grid_shape[1]
+
+        remaining_bits = string2bits(message)
+        indices_sequence = []
+        stats = EncodingStatistics()
+        patch_index = 0
+
+        with tqdm(total=len(remaining_bits), desc="Encoding message", disable=True) as progress:
+            while remaining_bits and current_row < grid_shape[0]:
+                feed_bits = remaining_bits[:DEFAULT_PRECISION_BITS]
+                # Record position before encoding
+                patch_row, patch_col = current_row, current_col
+                current_row, current_col, selected_idx, used_bits, range_bottom, range_top, encoded_bits_str = self.encode_patch(
+                    reference_tensor,
+                    building_tensor,
+                    current_row,
+                    current_col,
+                    grid_shape,
+                    image_translations.shape,
+                    bits_to_encode=feed_bits,
+                    random_sample=random_sample,
+                )
+                        
+                indices_sequence.append(selected_idx)
+                stats.add_patch_stat(patch_index, patch_row, patch_col, selected_idx, range_bottom, range_top, encoded_bits_str, used_bits)
+                remaining_bits = remaining_bits[used_bits:]
+                progress.update(used_bits)
+                patch_index += 1
+
+        if current_row < grid_shape[0]:
+            total_remaining = (grid_shape[0] - current_row) * grid_shape[1] - current_col
+            with tqdm(total=total_remaining, desc="Filling remaining patches", disable=True) as fill_progress:
+                while current_row < grid_shape[0]:
+                    patch_row, patch_col = current_row, current_col
+                    current_row, current_col, selected_idx, _, range_bottom, range_top, encoded_bits_str = self.encode_patch(
+                        reference_tensor,
+                        building_tensor,
+                        current_row,
+                        current_col,
+                        grid_shape,
+                        image_translations.shape,
+                        random_sample=True,
+                    )
+                    indices_sequence.append(selected_idx)
+                    stats.add_patch_stat(patch_index, patch_row, patch_col, selected_idx, range_bottom, range_top, encoded_bits_str, 0)
+                    fill_progress.update(1)
+                    patch_index += 1
+
+        output_image = self.model.decode_to_img(building_tensor.unsqueeze(0), image_translations.shape).squeeze()
+        return output_image, string2bits(message), indices_sequence, building_tensor, stats
 
 
 def encode_message_to_image(
         message: str,
         model: torch.nn.Module,
-        dsets : DataModuleFromConfig,
+        dsets: DataModuleFromConfig,
         random_sample: bool,
-        context_fraction : float
-) -> Tuple[torch.Tensor, str, List[int]]:
+        context_fraction: float
+) -> Tuple[torch.Tensor, str, List[int], torch.Tensor]:
     """
-    Encodes a text message into a generated image using steganography.
+    Convenience function to encode a message into an image using the SteganographyEncoder class.
 
     Args:
-        message: The text message to encode into the image.
-        model: The transformer model for prediction.
-        dsets: Dataset object containing the reference image.
-        # quiet (Optional): Impose to remove all the console outputs.
-        random_sample (Optional): If True, samples randomly without encoding.
+        message: The message to encode.
+        model: The VQGAN model.
+        dsets: The dataset configuration.
+        random_sample: Whether to sample randomly.
+        context_fraction: Fraction of context to use.
 
     Returns:
-        torch.Tensor: A generated image tensor (C, H, W) containing the encoded message.
+        Tuple of (image, bits, indices, tensor).
     """
-    image, cond_tensor = set_context(model, dsets, DEFAULT_CONTEXT_ROWS)
-
-    image_translations, image_indices = model.encode_to_z(image.unsqueeze(0))
-    cond_translations, cond_indices = model.encode_to_c(cond_tensor)
-
-    grid_shape = (image_translations.shape[2], image_translations.shape[3])
-
-    reference_tensor = cond_indices.reshape(
-        cond_translations.shape[0], cond_translations.shape[2], cond_translations.shape[3]
-    ).squeeze()
-
-    half_start = math.floor(image_indices.shape[1] * context_fraction)
-    building_tensor = image_indices
-    building_tensor[:, half_start:] = 0
-    building_tensor = building_tensor.reshape(grid_shape) # hw
-
-    current_row = half_start // grid_shape[1]
-    current_col = half_start % grid_shape[1]
-
-    message_bits = string2bits(message)
-    remaining_bits = message_bits
-    indices_sequence = []
-
-    # Encode message bits
-    pbar = tqdm(total=len(remaining_bits), desc="Encoding message", disable=True)
-    with pbar:
-        while remaining_bits:
-            next_bits = remaining_bits[:DEFAULT_PRECISION_BITS]
-
-            current_row, current_col, selected_idx, encoded_len = _encode_single_patch(
-                model, reference_tensor, building_tensor,
-                current_row, current_col, grid_shape,
-                bits_to_encode=next_bits, random_sample=random_sample
-            )
-            indices_sequence.append(selected_idx)
-
-            remaining_bits = remaining_bits[encoded_len:]
-            pbar.update(encoded_len)
-
-            if current_row >= grid_shape[0]:
-                break
-
-    # Fill remaining patches with random samples
-    if current_row < grid_shape[0]:
-        total_remaining = (grid_shape[0] - current_row) * grid_shape[1] - current_col
-        pbar = tqdm(total=total_remaining, desc="Filling remaining patches", disable=True)
-        with pbar:
-            while current_row < grid_shape[0]:
-                current_row, current_col, selected_idx, _ = _encode_single_patch(
-                    model, reference_tensor, building_tensor,
-                    current_row, current_col, grid_shape,
-                    random_sample=True
-                )
-                pbar.update(1)
-                indices_sequence.append(selected_idx)
-
-    # Decode to image
-    sampled_indices = building_tensor[:grid_shape[0], :grid_shape[1]].reshape(-1)
-    logger.info(f"Sampled image indices shape: {sampled_indices.shape}, min: {sampled_indices.min()}, max: {sampled_indices.max()}, sample: {sampled_indices[:10].tolist()}")
-    logger.info(f"Shape of building tensor: {building_tensor.shape}")
-    
-    image = model.decode_to_img(
-        building_tensor.unsqueeze(0),
-        image_translations.shape,
-    ).squeeze()
-    
-    # logger.info(f"Sampled image indices: {model.encode_to_z(image.unsqueeze(0))[1].squeeze()}")
-
-    return image, message_bits, indices_sequence, building_tensor
-
-def images_generation(
-        options: Options,
-        model: torch.nn.Module,
-        dsets: DataModuleFromConfig,
-        random_generation: bool
-) -> None:
-    logger.info(f"Random seed: {options.seed}")
-    reset_seeds(options.seed)
-    for i in range(options.to_gen_number):
-        logger.info(f"Generating image {i+1}/{options.to_gen_number} {'(random image)' if random_generation else '(encoding message)'}...")
-        
-        generated_image, bits_string, indices_sequence, building_tensor = encode_message_to_image(
-            options.message,
-            model, dsets,
-            random_sample=random_generation,
-            context_fraction=options.context_fraction
-        )
-        path = os.path.join(options.output_directory, "random" if random_generation else "meteor", f"rand_{i:03}")
-        save_image(generated_image, path)
-        logger.info(f"Image saved to {path}.png")
-        arr = generated_image.detach().cpu().numpy()
-        with open(path + "_encoded_bits.txt", "x") as f:
-            f.write(bits_string)
-        with open(path + "_encoded_indices.txt", "x") as f:
-            f.write(np.array2string(np.array(indices_sequence), suppress_small=True))
+    encoder = SteganographyEncoder(model, dsets, context_fraction=context_fraction)
+    return encoder.encode_message_to_image(message, random_sample=random_sample)

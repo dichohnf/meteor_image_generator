@@ -8,6 +8,13 @@ from typing import Optional
 
 
 def initialized_parser() -> ArgumentParser:
+    """
+    Creates and configures the command-line argument parser for the steganography application.
+    Defines all necessary arguments for message encoding, model configuration, and output settings.
+
+    Returns:
+        Configured ArgumentParser instance ready to parse command-line arguments.
+    """
     parser = argparse.ArgumentParser(
         description='Encode a message into an image using steganography',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -44,6 +51,11 @@ def initialized_parser() -> ArgumentParser:
     return parser
 
 class Options:
+    """
+    Configuration class holding all settings for the steganography encoding and decoding process.
+    Manages message, model paths, generation parameters, and output configurations.
+    """
+
     def __init__(
         self, message : str,
         model_directory_path : str,
@@ -57,6 +69,23 @@ class Options:
         relative_options_file_path : Optional[str] = None,
         random_generation : bool = False,
     ) -> None:
+        """
+        Initializes the Options object with user-specified or default parameters.
+
+        Args:
+            message: The secret message to embed in images.
+            model_directory_path: Path to the VQGAN model directory.
+            context_fraction: Fraction of image used as context.
+            quiet: If True, suppresses console output.
+            seed: Random seed for reproducibility.
+            to_gen_number: Number of images to generate.
+            output_directory_path: Directory to save outputs.
+            relative_options_file_path: Path for options JSON file.
+            random_generation: If True, generates random images without messages.
+
+        Raises:
+            ArgumentError: If required parameters are invalid.
+        """
         if message is None:
             raise ArgumentError(message, "Message cannot be None")
         self.message = message
@@ -74,6 +103,10 @@ class Options:
         self.random_generation = random_generation
 
     def save_as_file(self) -> None:
+        """
+        Saves the current options configuration to a JSON file in the output directory.
+        Creates the output directory if it doesn't exist.
+        """
         if not os.path.exists(self.output_directory):
             os.makedirs(self.output_directory)
 

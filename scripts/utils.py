@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 from torch import Tensor
 from torch.utils.data.dataloader import default_collate
 from torchvision.io import write_png
+from scripts.logger import logger
 
 # Constants
 PATCH_SIZE = 16
@@ -23,19 +24,18 @@ LN2 = 0.69315  # ln(2) for entropy calculation
 
 def bits2string(binary_str: str, code: str = 'ASCII') -> str:
     """
-    Decodes a binary string back into its original message using the specified encoding.
+    Converts a binary string back into its original text message using the specified encoding scheme.
+    Supports ASCII, UNICODE, and DECIMAL encodings, automatically handling padding and invalid bits.
 
     Args:
-        binary_str (str): The binary string to decode.
-        code (str, optional): The encoding scheme used for decoding. Can be 'ASCII',
-                            'UNICODE', or 'DECIMAL'. Defaults to 'ASCII'.
+        binary_str: The binary string to decode (e.g., '01001000').
+        code: The encoding standard to use ('ASCII', 'UNICODE', or 'DECIMAL'). Defaults to 'ASCII'.
 
     Returns:
-        str: The decoded message as a string.
+        The decoded text message as a string.
 
     Raises:
-        ValueError: If the length of `binary_str` is not compatible with the specified `code`.
-                     Or if an invalid encoding scheme is provided.
+        ValueError: If an unsupported encoding is specified or the message format is invalid.
     """
 
     encoding_config = {
@@ -85,17 +85,18 @@ def bits2string(binary_str: str, code: str = 'ASCII') -> str:
 
 def string2bits(message: str, code: str = 'ASCII') -> str:
     """
-    Converts a string message into its binary representation.
+    Encodes a text message into its binary representation using the specified encoding scheme.
+    Each character is converted to its binary equivalent with proper padding.
 
     Args:
-        message: The input string to be converted.
-        code: The encoding standard ('ASCII', 'UNICODE', or 'DECIMAL').
+        message: The text message to encode.
+        code: The encoding standard ('ASCII', 'UNICODE', or 'DECIMAL'). Defaults to 'ASCII'.
 
     Returns:
-        str: A binary string representing the entire input message.
+        A concatenated binary string representing the entire message.
 
     Raises:
-        ValueError: If encoding is unsupported or message is invalid.
+        ValueError: If an unsupported encoding is specified or the message is invalid for the encoding.
     """
     code = code.upper()
     bits = ""
@@ -119,6 +120,35 @@ def string2bits(message: str, code: str = 'ASCII') -> str:
         bits += bin(char_code)[2:].zfill(bit_width)
 
     return bits
+
+
+def encode_text_to_bits(message: str, code: str = 'ASCII') -> str:
+    """
+    Converts a text message into its binary representation using the specified encoding.
+
+    Args:
+        message: The input text to convert.
+        code: Encoding type ('ASCII', 'UNICODE', or 'DECIMAL').
+
+    Returns:
+        Binary string representation of the message.
+    """
+    return string2bits(message, code=code)
+
+
+def decode_bits_to_text(binary_str: str, code: str = 'ASCII') -> str:
+    """
+    Converts a binary string back into readable text using the specified encoding.
+
+    Args:
+        binary_str: The binary string to decode.
+        code: Encoding type ('ASCII', 'UNICODE', or 'DECIMAL').
+
+    Returns:
+        Decoded text message.
+    """
+    return bits2string(binary_str, code=code)
+
 
 def bits2int(bits: str, *, reversed: bool = False) -> int:
     """

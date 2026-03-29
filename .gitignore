@@ -225,3 +225,6 @@ __marimo__/
 .idea/
 logs/
 examples/
+
+.vs*/
+miniconda3/

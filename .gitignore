@@ -1,18 +1,3 @@
-*
-
-!**/
-
-!assets
-!configs
-!data
-!taming
-!envirorment.yaml
-!License.txt
-!/main.py
-!/README.md
-!/setup.py
-!/.gitignore
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

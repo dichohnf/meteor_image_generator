@@ -14,6 +14,7 @@ from scripts.utils import bits2int, build_context_from_patches, int2bits, count_
 from scripts.utils import PATCH_SIZE, DEFAULT_CODEBOOK_SIZE, DEFAULT_PRECISION_BITS, DEFAULT_CONTEXT_ROWS
 from scripts.logger import logger
 from scripts.stats import EncodingStatistics
+from scripts.error_correction import ErrorCorrectionCode
 
 
 class SteganographyEncoder:
@@ -23,7 +24,13 @@ class SteganographyEncoder:
     to embed message bits while maintaining visual fidelity.
     """
 
-    def __init__(self, model: torch.nn.Module, dsets: DataModuleFromConfig, context_fraction: float = DEFAULT_CONTEXT_ROWS):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        dsets: DataModuleFromConfig,
+        context_fraction: float = DEFAULT_CONTEXT_ROWS,
+        error_correction: Optional[ErrorCorrectionCode] = None,
+    ):
         """
         Initializes the encoder with the VQGAN model, dataset, and context fraction.
 
@@ -31,10 +38,13 @@ class SteganographyEncoder:
             model: The trained VQGAN transformer model for generating image patches.
             dsets: The dataset configuration containing reference images.
             context_fraction: Fraction of the image used as context for generation.
+            error_correction: Optional ErrorCorrectionCode instance for adding redundancy
+                              to message bits before encoding. If None, no error correction is applied.
         """
         self.model = model
         self.dsets = dsets
         self.context_fraction = context_fraction
+        self.error_correction = error_correction
 
     @torch.no_grad()
     def select_token_for_patch(
@@ -206,7 +216,17 @@ class SteganographyEncoder:
         current_row = half_start // grid_shape[1]
         current_col = half_start % grid_shape[1]
 
-        remaining_bits = string2bits(message)
+        # Apply error correction encoding if configured
+        if self.error_correction is not None:
+            original_bits = string2bits(message)
+            remaining_bits = self.error_correction.encode(original_bits)
+            logger.info(
+                f"Error correction enabled: message {len(original_bits)} original bits -> "
+                f"{len(remaining_bits)} encoded bits (factor={self.error_correction.repetition_factor})"
+            )
+        else:
+            remaining_bits = string2bits(message)
+
         indices_sequence = []
         stats = EncodingStatistics()
         patch_index = 0

@@ -15,6 +15,7 @@ from scripts.encode_methods import SteganographyEncoder
 from scripts.input import Options, initialized_parser
 from scripts.utils import get_vqgan_sflckr, reset_seeds, save_image
 from scripts.stats import StatsWriter
+from scripts.error_correction import ErrorCorrectionCode
 
 
 def main():
@@ -36,6 +37,7 @@ def main():
         relative_options_file_path=args.relative_options_file,
         seed=args.seed,
         random_generation=args.random_generation,
+        max_error_ratio=args.max_error_ratio,
     )
 
     if os.path.exists(options.output_directory):
@@ -50,8 +52,11 @@ def main():
     dsets, model = get_vqgan_sflckr(options.model_directory_path)
     logger.info("VQGAN MODEL AND DATASETS SETUP COMPLETED.")
 
-    encoder = SteganographyEncoder(model, dsets, context_fraction=options.context_fraction)
-    decoder = SteganographyDecoder(model, dsets, context_fraction=options.context_fraction)
+    error_correction = ErrorCorrectionCode(max_error_ratio=options.max_error_ratio)
+    logger.info(f"Error correction initialized: {error_correction}")
+
+    encoder = SteganographyEncoder(model, dsets, context_fraction=options.context_fraction, error_correction=error_correction)
+    decoder = SteganographyDecoder(model, dsets, context_fraction=options.context_fraction, error_correction=error_correction)
 
     reset_seeds(options.seed)
     if options.random_generation:

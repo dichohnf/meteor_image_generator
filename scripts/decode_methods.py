@@ -12,6 +12,7 @@ from scripts.utils import (DEFAULT_CONTEXT_ROWS, set_context, bits2string, int2b
                            DEFAULT_PRECISION_BITS, DEFAULT_CODEBOOK_SIZE, PATCH_SIZE)
 from scripts.logger import logger
 from scripts.stats import DecodingStatistics
+from scripts.error_correction import ErrorCorrectionCode
 
 
 def load_image(path: str) -> torch.Tensor:
@@ -27,7 +28,13 @@ class SteganographyDecoder:
     This class extracts embedded bits from image patches and reconstructs the original message.
     """
 
-    def __init__(self, model: torch.nn.Module, dsets: DataModuleFromConfig, context_fraction: float = DEFAULT_CONTEXT_ROWS):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        dsets: DataModuleFromConfig,
+        context_fraction: float = DEFAULT_CONTEXT_ROWS,
+        error_correction: Optional[ErrorCorrectionCode] = None,
+    ):
         """
         Initializes the decoder with the VQGAN model, dataset, and context fraction.
 
@@ -35,10 +42,15 @@ class SteganographyDecoder:
             model: The trained VQGAN transformer model for analyzing image patches.
             dsets: The dataset configuration containing reference images.
             context_fraction: Fraction of the image used as context for decoding.
+            error_correction: Optional ErrorCorrectionCode instance for correcting bit errors
+                              that may have been introduced during the VQGAN re-encoding process.
+                              Must be the same instance used during encoding. If None, no error
+                              correction is applied.
         """
         self.model = model
         self.dsets = dsets
         self.context_fraction = context_fraction
+        self.error_correction = error_correction
 
     @torch.no_grad()
     def decode_token_from_patch(
@@ -233,6 +245,16 @@ class SteganographyDecoder:
                 decoded_bits += token_bits
                 pbar.update(1)
                 patch_index += 1
+
+        # Apply error correction decoding if configured
+        if self.error_correction is not None:
+            corrected_bits = self.error_correction.decode(decoded_bits)
+            logger.info(
+                f"Error correction decoding applied: {len(decoded_bits)} raw bits -> "
+                f"{len(corrected_bits)} corrected bits"
+            )
+            decoded_text = bits2string(corrected_bits)
+            return decoded_text, corrected_bits, selected_indices, stats
 
         return bits2string(decoded_bits), decoded_bits, selected_indices, stats
 

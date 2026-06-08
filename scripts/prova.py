@@ -10,8 +10,8 @@ if scripts_path not in os.sys.path:
     os.sys.path.append(scripts_path)
 
 from scripts.logger import logger
-from scripts.decode_methods import SteganographyDecoder, load_image
-from scripts.encode_methods import SteganographyEncoder
+from scripts.decoder import SteganographyDecoder, load_image
+from scripts.encoder import SteganographyEncoder
 from scripts.input import Options, initialized_parser
 from scripts.utils import get_vqgan_sflckr, reset_seeds, save_image
 from scripts.stats import StatsWriter

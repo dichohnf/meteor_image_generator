@@ -15,7 +15,7 @@ from scripts.encode_methods import SteganographyEncoder
 from scripts.input import Options, initialized_parser
 from scripts.utils import get_vqgan_sflckr, reset_seeds, save_image
 from scripts.stats import StatsWriter
-from scripts.error_correction import ErrorCorrectionCode
+from scripts.error_correction import ErrorCorrectionFactory
 
 
 def main():
@@ -39,6 +39,8 @@ def main():
         random_generation=args.random_generation,
         max_error_ratio=args.max_error_ratio,
         burst_error_tolerance=args.burst_error_tolerance,
+        error_correction_method=args.error_correction_method,
+        rs_nsym=args.rs_nsym,
     )
 
     if os.path.exists(options.output_directory):
@@ -53,7 +55,14 @@ def main():
     dsets, model = get_vqgan_sflckr(options.model_directory_path)
     logger.info("VQGAN MODEL AND DATASETS SETUP COMPLETED.")
 
-    error_correction = ErrorCorrectionCode(burst_error_tolerance=options.burst_error_tolerance)
+    method = options.error_correction_method
+    if method == "vote":
+        ecc_kwargs = {"burst_error_tolerance": options.burst_error_tolerance}
+    elif method == "reed_solomon":
+        ecc_kwargs = {"nsym": options.rs_nsym}
+    else:
+        ecc_kwargs = {"burst_error_tolerance": options.burst_error_tolerance}
+    error_correction = ErrorCorrectionFactory.create(method, **ecc_kwargs)
     logger.info(f"Error correction initialized: {error_correction}")
 
     encoder = SteganographyEncoder(model, dsets, context_fraction=options.context_fraction, error_correction=error_correction)

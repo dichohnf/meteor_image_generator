@@ -1,203 +1,368 @@
 """
 Error correction module for the steganography system.
 
-Provides a configurable error correction code that adds redundancy to message bits
-before encoding into images, and corrects errors during decoding.
+Provides multiple error correction algorithms:
+1. VoteCorrectionCode — full-message repetition with majority voting (burst-resistant)
+2. ReedSolomonCorrectionCode — Reed-Solomon block code over GF(256) via ``reedsolo``
+3. ErrorCorrectionFactory — static factory to build the appropriate codec by name.
 
-The correction scheme uses a full-message repetition code with majority voting:
-- The entire message (as a bit string) is repeated N times (odd number)
-- During decoding, the repetitions are aligned and bit-by-bit majority voting
-  recovers the original message
-- This is robust against burst errors because a single corrupted patch only
-  corrupts bits at a fixed position in each repetition, leaving the majority
-  of repetitions intact at those positions.
-- The burst_error_tolerance parameter controls the number of consecutive
-  bit errors the algorithm can withstand in the encoded stream.
+All codecs implement the abstract ErrorCorrectionCode interface with
+    encode(bits: str) -> str
+    decode(encoded_bits: str) -> str
 """
 
-import math
-from typing import Tuple
-
+from abc import ABC, abstractmethod
+from typing import ClassVar, List
 from scripts.logger import logger
 
 
-class ErrorCorrectionCode:
+# ======================================================================
+#  Abstract base
+# ======================================================================
+
+class ErrorCorrectionCode(ABC):
     """
-    Provides error correction encoding and decoding for binary message bits.
+    Abstract base class for error correction codecs.
 
-    Uses a full-message repetition code with majority voting. Unlike a
-    per-bit repetition code (which repeats each individual bit N times
-    consecutively), this repeats the ENTIRE message N times. This design
-    is specifically chosen to handle burst errors typical in VQGAN
-    steganography, where a single corrupted patch can corrupt up to
-    DEFAULT_PRECISION_BITS (16) consecutive bits in the decoded stream.
+    All concrete implementations must provide encode() and decode()
+    methods that operate on binary strings ("010101...").
+    """
 
-    With full-message repetition, a burst of B consecutive errors corrupts
-    at most one position in each repetition of the message. If the number
-    of repetitions N is odd and B < N, majority voting can still recover
-    the correct bit at every position.
+    name: ClassVar[str] = "abstract"
+
+    @abstractmethod
+    def encode(self, bits: str) -> str:
+        """Encode a binary string by adding error correction redundancy."""
+        ...
+
+    @abstractmethod
+    def decode(self, encoded_bits: str) -> str:
+        """Decode a binary string by detecting/correcting errors."""
+        ...
+
+    @property
+    @abstractmethod
+    def overhead_ratio(self) -> float:
+        """Overhead factor introduced by the code (1.0 = no overhead)."""
+        ...
+
+
+# ======================================================================
+#  1 — VoteCorrectionCode (full-message repetition + majority voting)
+# ======================================================================
+
+class VoteCorrectionCode(ErrorCorrectionCode):
+    """
+    Full-message repetition code with majority voting.
+
+    The entire message bit string is repeated N times (odd number).
+    During decoding, the repetitions are aligned and bit-by-bit majority
+    voting recovers each original bit.
+
+    This code is optimised for **burst errors** caused by VQGAN patch
+    re-encoding.  A single patch corruption flips at most
+    ``DEFAULT_PRECISION_BITS`` (16) consecutive bits within **one copy**
+    of the message.  With ``repetitions = 2 * burst_error_tolerance + 1``,
+    the algorithm can survive up to ``burst_error_tolerance`` such
+    corrupted patches without losing data.
+
+    The algorithm is:
+
+        repetitions = 2 * burst_error_tolerance + 1
+        encoded_bits = message_bits * repetitions
+        decode:
+            for each bit position i:
+                vote = majority(copy_0[i], copy_1[i], ..., copy_N[i])
+                recovered[i] = vote
 
     Attributes:
-        burst_error_tolerance: Maximum number of consecutive bit errors
-            the code can withstand in the encoded stream.
-        repetitions: Number of times the entire message is repeated (odd).
-        _correctable_per_position: Number of errors that can be tolerated
-            per bit position (= repetitions // 2).
+        burst_error_tolerance: Maximum number of patches that can be
+            corrupted without losing data (default 10).
+        repetitions: Number of copies of the message (always odd).
     """
 
+    name: ClassVar[str] = "vote"
+
     def __init__(self, burst_error_tolerance: int = 10) -> None:
-        """
-        Initializes the error correction code with the given burst error tolerance.
-
-        Args:
-            burst_error_tolerance: Maximum number of consecutive bit errors
-                the code can withstand (default 10). The number of repetitions
-                is set to burst_error_tolerance * 2 + 1, ensuring that even
-                if all bits in a single patch (up to burst_error_tolerance)
-                are corrupted for a given position across repetitions,
-                majority voting can still recover the correct value.
-
-        Raises:
-            ValueError: If burst_error_tolerance is negative.
-        """
-        if burst_error_tolerance < 0:
+        if burst_error_tolerance < 1:
             raise ValueError(
-                f"burst_error_tolerance must be >= 0, got {burst_error_tolerance}"
+                f"burst_error_tolerance must be >= 1, got {burst_error_tolerance}"
             )
         self.burst_error_tolerance = burst_error_tolerance
-        # N repetitions: if burst destroys up to burst_error_tolerance copies
-        # of a given bit position, the remaining copies still win via majority
         self.repetitions = burst_error_tolerance * 2 + 1
         self._correctable_per_position = self.repetitions // 2
 
     def encode(self, bits: str) -> str:
-        """
-        Encodes a binary string by repeating the entire message N times.
-
-        This creates N consecutive copies of the full message bit string,
-        which are then embedded into the image. If a patch is corrupted
-        during VQGAN re-encoding, only one copy of the affected bits is lost,
-        and majority voting can recover them.
-
-        Args:
-            bits: The original binary string (e.g., "10110").
-
-        Returns:
-            The encoded binary string with redundancy added.
-        """
         if not bits:
             return ""
-
         encoded = bits * self.repetitions
         logger.info(
-            f"Error correction encoding: {len(bits)} bits -> {len(encoded)} bits "
-            f"(repetitions={self.repetitions}, burst_error_tolerance={self.burst_error_tolerance})"
+            f"[Vote] encode: {len(bits)} bits -> {len(encoded)} bits "
+            f"(repetitions={self.repetitions})"
         )
         return encoded
 
     def decode(self, encoded_bits: str) -> str:
-        """
-        Decodes a binary string by applying majority voting across repetitions.
-
-        The encoded bits consist of N consecutive copies of the original message.
-        The method splits the encoded stream into N blocks, aligns them by
-        position, and applies majority voting for each bit position.
-
-        Args:
-            encoded_bits: The encoded binary string (potentially with errors).
-
-        Returns:
-            The corrected original binary string.
-        """
         if not encoded_bits:
             return ""
 
-        # The message length is the total encoded length divided by repetitions
         message_len = len(encoded_bits) // self.repetitions
-
         if message_len == 0:
             return ""
 
-        decoded_parts = []
-        total_errors_corrected = 0
-        positions_with_errors = 0
+        decoded_parts: List[str] = []
+        total_errors = 0
+        error_positions = 0
 
         for pos in range(message_len):
-            # Collect the bit at position 'pos' from each repetition
-            bits_at_position = []
-            for rep in range(self.repetitions):
-                idx = rep * message_len + pos
-                if idx < len(encoded_bits):
-                    bits_at_position.append(encoded_bits[idx])
-
-            # Count 0s and 1s
-            ones = bits_at_position.count("1")
-            zeros = len(bits_at_position) - ones
+            bits_at_pos = [
+                encoded_bits[rep * message_len + pos]
+                for rep in range(self.repetitions)
+                if rep * message_len + pos < len(encoded_bits)
+            ]
+            ones = bits_at_pos.count("1")
+            zeros = len(bits_at_pos) - ones
 
             if ones > zeros:
-                recovered_bit = "1"
-                errors_at_position = zeros
+                recovered = "1"
+                err = zeros
             elif zeros > ones:
-                recovered_bit = "0"
-                errors_at_position = ones
+                recovered = "0"
+                err = ones
             else:
-                # Tie (shouldn't happen with odd repetitions, but be safe)
-                recovered_bit = bits_at_position[0]
-                errors_at_position = len(bits_at_position) // 2
+                recovered = bits_at_pos[0]
+                err = len(bits_at_pos) // 2
 
-            decoded_parts.append(recovered_bit)
-            total_errors_corrected += errors_at_position
-            if errors_at_position > 0:
-                positions_with_errors += 1
+            decoded_parts.append(recovered)
+            total_errors += err
+            if err > 0:
+                error_positions += 1
 
         decoded = "".join(decoded_parts)
 
-        # Compute actual error statistics
-        total_processed_bits = message_len * self.repetitions
-        actual_error_ratio = (
-            total_errors_corrected / total_processed_bits
-            if total_processed_bits > 0
-            else 0.0
-        )
+        total_bits = message_len * self.repetitions
+        err_ratio = total_errors / total_bits if total_bits else 0.0
 
-        if positions_with_errors > 0:
+        if error_positions > 0:
             logger.info(
-                f"Error correction decoding: corrected {total_errors_corrected} bit errors "
-                f"across {positions_with_errors} positions "
-                f"(actual error ratio={actual_error_ratio:.4f}, "
-                f"burst_error_tolerance={self.burst_error_tolerance})"
+                f"[Vote] decode: corrected {total_errors} errors across "
+                f"{error_positions} positions (err_ratio={err_ratio:.4f})"
             )
-            if total_errors_corrected > positions_with_errors:
-                # Some positions had multiple errors
-                max_errors = max(
-                    sum(
-                        1
-                        for rep in range(self.repetitions)
-                        if rep * message_len + pos < len(encoded_bits)
-                        and encoded_bits[rep * message_len + pos] != decoded_parts[pos]
-                    )
-                    for pos in range(message_len)
-                )
-                if max_errors > self._correctable_per_position:
-                    logger.warning(
-                        f"A position had {max_errors} errors (max correctable = "
-                        f"{self._correctable_per_position}). Some bits may still be corrupted."
-                    )
         else:
-            logger.info("Error correction decoding: no errors detected.")
+            logger.info("[Vote] decode: no errors detected.")
 
         return decoded
 
     @property
     def overhead_ratio(self) -> float:
-        """
-        Returns the overhead ratio introduced by error correction encoding.
-        E.g., repetitions=3 means 3x the original bits (200% overhead).
-        """
-        return self.repetitions
+        return float(self.repetitions)
 
     def __repr__(self) -> str:
         return (
-            f"ErrorCorrectionCode(burst_error_tolerance={self.burst_error_tolerance}, "
+            f"VoteCorrectionCode(burst_error_tolerance={self.burst_error_tolerance}, "
             f"repetitions={self.repetitions})"
         )
+
+
+# ======================================================================
+#  2 — Reed-Solomon code via the ``reedsolo`` library
+#
+#  This wrapper uses the public reedsolo.RSCodec interface.
+#  Install with:  pip install reedsolo
+# ======================================================================
+
+class ReedSolomonCorrectionCode(ErrorCorrectionCode):
+    """
+    Reed-Solomon error correction over GF(256).
+
+    Wraps the ``reedsolo.RSCodec`` class.  Operates on bytes internally.
+    The message bit string is padded to a byte boundary, RS-encoded, then
+    converted back to bits.  Decoding reverses the process.
+
+    Requires the ``reedsolo`` package (``pip install reedsolo``).
+
+    Attributes:
+        nsym: Number of ECC symbols (bytes) to append.
+              Can correct up to nsym // 2 erroneous bytes.
+    """
+
+    name: ClassVar[str] = "reed_solomon"
+
+    def __init__(self, nsym: int = 10, **kwargs) -> None:
+        if nsym < 1:
+            raise ValueError(f"nsym must be >= 1, got {nsym}")
+
+        # Try importing reedsolo; fail early if not installed.
+        try:
+            from reedsolo import RSCodec
+        except ImportError:
+            raise ImportError(
+                "ReedSolomonCorrectionCode requires the 'reedsolo' package.\n"
+                "Install with:  pip install reedsolo"
+            ) from None
+
+        # Forward any compatible kwargs to RSCodec constructor
+        c_primitive = kwargs.pop("c_primitive", None)
+
+        self.nsym = nsym
+        self._codec = (
+            RSCodec(nsym) if c_primitive is None
+            else RSCodec(nsym, c_primitive=c_primitive)
+        )
+
+    # ---- public interface -----------------------------------------------
+
+    def encode(self, bits: str) -> str:
+        if not bits:
+            return ""
+
+        # Pad bits to byte boundary
+        pad_len = (8 - len(bits) % 8) % 8
+        padded_bits = bits + "0" * pad_len
+
+        # Convert to bytes
+        msg_bytes = self._bits_to_bytes(padded_bits)
+
+        # RS encode (reedsolo.RSCodec.encode returns bytearray)
+        codeword = bytes(self._codec.encode(bytearray(msg_bytes)))
+
+        # Convert back to bits
+        encoded_bits = self._bytes_to_bits(codeword)
+
+        # Prepend padding length as 3 bits (0-7) so decoder knows how to strip
+        header = format(pad_len, "03b")
+        result = header + encoded_bits
+
+        logger.info(
+            f"[RS] encode: {len(bits)} bits -> {len(result)} bits "
+            f"(nsym={self.nsym}, pad={pad_len})"
+        )
+        return result
+
+    def decode(self, encoded_bits: str) -> str:
+        if not encoded_bits:
+            return ""
+
+        # Minimum length: 3 header bits + at least 1 byte
+        if len(encoded_bits) < 3 + 8:
+            logger.warning("[RS] decode: encoded bits too short")
+            return ""
+
+        # Extract header (padding length)
+        pad_len = int(encoded_bits[:3], 2)
+
+        # Convert to bytes
+        body_bits = encoded_bits[3:]
+        if len(body_bits) < 8:
+            return ""
+        rx_bytes = self._bits_to_bytes(body_bits)
+
+        # RS decode (reedsolo.RSCodec.decode returns (decoded, ecc, errata_pos))
+        errata: list = []
+        try:
+            decoded_ba, ecc_ba, errata = self._codec.decode(bytearray(rx_bytes))
+            success = True
+            corrected_bytes = bytes(decoded_ba)
+        except Exception as exc:
+            logger.warning(
+                f"[RS] decode: RS decoding failed ({exc}). "
+                "Returning raw data (strip ECC)."
+            )
+            success = False
+            corrected_bytes = rx_bytes[:len(rx_bytes) - self.nsym]
+
+        # Convert back to bits
+        decoded_bits = self._bytes_to_bits(corrected_bytes)
+
+        # Strip padding
+        if pad_len > 0:
+            decoded_bits = decoded_bits[:-pad_len]
+
+        if not success:
+            logger.info("[RS] decode: completed with fallback (no correction)")
+        else:
+            logger.info(
+                f"[RS] decode: success ({len(decoded_bits)} bits recovered, "
+                f"{len(errata)} errors corrected)"
+            )
+
+        return decoded_bits
+
+    @property
+    def overhead_ratio(self) -> float:
+        """
+        For RS, the overhead depends on message size.
+        Returns worst-case overhead for small messages.
+        """
+        return 1.0 + (self.nsym + 1) / max(1, 1)  # header byte + nsym bytes
+
+    # ---- internal helpers -----------------------------------------------
+
+    @staticmethod
+    def _bits_to_bytes(bits: str) -> bytes:
+        """Convert a binary string (multiple of 8) to bytes."""
+        return bytes(
+            int(bits[i:i + 8], 2) for i in range(0, len(bits), 8)
+        )
+
+    @staticmethod
+    def _bytes_to_bits(data: bytes) -> str:
+        """Convert bytes to a binary string."""
+        return "".join(format(b, "08b") for b in data)
+
+    def __repr__(self) -> str:
+        return f"ReedSolomonCorrectionCode(nsym={self.nsym})"
+
+
+# ======================================================================
+#  3 — ErrorCorrectionFactory
+# ======================================================================
+
+class ErrorCorrectionFactory:
+    """
+    Static factory for building ErrorCorrectionCode instances by name.
+
+    Usage::
+
+        ecc = ErrorCorrectionFactory.create("vote", burst_error_tolerance=10)
+        ecc = ErrorCorrectionFactory.create("reed_solomon", nsym=10)
+    """
+
+    _REGISTRY: ClassVar[dict] = {
+        "vote": VoteCorrectionCode,
+        "reed_solomon": ReedSolomonCorrectionCode,
+    }
+
+    @staticmethod
+    def register(name: str, codec_class: type) -> None:
+        """Register a custom codec class under *name*."""
+        ErrorCorrectionFactory._REGISTRY[name] = codec_class
+
+    @staticmethod
+    def create(method: str, **kwargs) -> ErrorCorrectionCode:
+        """
+        Build and return an ErrorCorrectionCode instance.
+
+        Args:
+            method: Algorithm name.  Built-in choices are ``"vote"`` and
+                    ``"reed_solomon"``.  Custom names can be added via
+                    :meth:`register`.
+            **kwargs: Keyword arguments forwarded to the concrete class
+                      constructor.
+
+        Returns:
+            An :class:`ErrorCorrectionCode` instance.
+
+        Raises:
+            ValueError: If *method* is not recognised.
+        """
+        cls = ErrorCorrectionFactory._REGISTRY.get(method)
+        if cls is None:
+            raise ValueError(
+                f"Unknown error correction method {method!r}. "
+                f"Available: {list(ErrorCorrectionFactory._REGISTRY)}"
+            )
+        logger.info(
+            f"Factory: building {cls.__name__} with kwargs {kwargs}"
+        )
+        return cls(**kwargs)

@@ -58,6 +58,19 @@ def initialized_parser() -> ArgumentParser:
                              'Maximum tolerable bit error ratio for error correction (0.0 to 1.0). '
                              'Default 0.2 means up to 20%% of bits can be corrected. '
                              'Higher values add more redundancy but allow more error recovery.')
+    parser.add_argument('--error-correction-method',
+                        type=str, required=False, default='vote',
+                        choices=['vote', 'reed_solomon'],
+                        help='Error correction algorithm to use. "vote" uses full-message '
+                             'repetition with majority voting (burst-resistant). '
+                             '"reed_solomon" uses Reed-Solomon block coding over GF(256). '
+                             'Default: "vote".')
+    parser.add_argument('--rs-nsym',
+                        type=int, required=False, default=10,
+                        help='Number of ECC symbols for Reed-Solomon code. '
+                             'Can correct up to nsym // 2 erroneous bytes. '
+                             'Only used when --error-correction-method=reed_solomon. '
+                             'Default: 10.')
     parser.set_defaults(random_generation=False)
     return parser
 
@@ -81,6 +94,8 @@ class Options:
         random_generation : bool = False,
         max_error_ratio : float = 0.2,
         burst_error_tolerance : int = 10,
+        error_correction_method : str = "vote",
+        rs_nsym : int = 10,
     ) -> None:
         """
         Initializes the Options object with user-specified or default parameters.
@@ -122,6 +137,8 @@ class Options:
         # Convert max_error_ratio to burst_error_tolerance if the legacy parameter is used
         # and burst_error_tolerance wasn't explicitly provided
         self.burst_error_tolerance = burst_error_tolerance
+        self.error_correction_method = error_correction_method
+        self.rs_nsym = rs_nsym
 
     def save_as_file(self) -> None:
         """

@@ -200,7 +200,8 @@ class SteganographyEncoder:
             remaining_bits = self.error_correction.encode(original_bits)
             logger.info(
                 f"Error correction enabled: message {len(original_bits)} original bits -> "
-                f"{len(remaining_bits)} encoded bits (factor={self.error_correction.repetition_factor})"
+                f"{len(remaining_bits)} encoded bits "
+                f"(overhead_ratio={self.error_correction.overhead_ratio})"
             )
         else:
             remaining_bits = string2bits(message)

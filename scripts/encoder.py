@@ -149,35 +149,13 @@ class SteganographyEncoder:
             reference_indices, building_indices, current_row, current_col, grid_shape
         )
 
-        count = 0
-        while True:
-            count += 1
-            if count > 100:  # Prevent infinite loops
-                logger.warning(f"Exceeded maximum attempts to encode patch at ({current_row}, {current_col}). Proceeding with last selection.")
-                selected_idx = building_indices[current_row, current_col].item()
-                encoded_length = 0
-                range_bottom, range_top = 0, DEFAULT_CODEBOOK_SIZE
-                encoded_bits_str = ""
-                break
-
-            selected_idx, encoded_length, range_bottom, range_top, encoded_bits_str = self.select_token_for_patch(
-                context,
-                bits_to_encode,
-                (local_row, local_col),
-                random_sample=random_sample,
-            )
-            building_indices[current_row, current_col] = selected_idx
-
-            exit_condition = random_sample or \
-                self.model.encode_to_z(
-                    self.model.decode_to_img(
-                        building_indices.unsqueeze(0),
-                        image_translations_shape)
-                )[1].squeeze().reshape(grid_shape)[current_row, current_col].item() \
-                == selected_idx
-        
-            if exit_condition:
-                break
+        selected_idx, encoded_length, range_bottom, range_top, encoded_bits_str = self.select_token_for_patch(
+            context,
+            bits_to_encode,
+            (local_row, local_col),
+            random_sample=random_sample,
+        )
+        building_indices[current_row, current_col] = selected_idx
 
         next_col = current_col + 1
         next_row = current_row

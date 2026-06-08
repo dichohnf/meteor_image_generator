@@ -38,6 +38,7 @@ def main():
         seed=args.seed,
         random_generation=args.random_generation,
         max_error_ratio=args.max_error_ratio,
+        burst_error_tolerance=args.burst_error_tolerance,
     )
 
     if os.path.exists(options.output_directory):
@@ -52,7 +53,7 @@ def main():
     dsets, model = get_vqgan_sflckr(options.model_directory_path)
     logger.info("VQGAN MODEL AND DATASETS SETUP COMPLETED.")
 
-    error_correction = ErrorCorrectionCode(max_error_ratio=options.max_error_ratio)
+    error_correction = ErrorCorrectionCode(burst_error_tolerance=options.burst_error_tolerance)
     logger.info(f"Error correction initialized: {error_correction}")
 
     encoder = SteganographyEncoder(model, dsets, context_fraction=options.context_fraction, error_correction=error_correction)

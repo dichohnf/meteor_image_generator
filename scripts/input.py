@@ -47,9 +47,15 @@ def initialized_parser() -> ArgumentParser:
                         help='Whatever the code should generate even images with random sampling (top_k)')
     parser.add_argument('--without-random-generation',
                         dest='random_generation', action='store_false')
+    parser.add_argument('--burst-error-tolerance',
+                        type=int, required=False, default=10,
+                        help='Maximum number of consecutive bit errors the error correction can withstand. '
+                             'Default 10. The overhead is burst_error_tolerance * 2 + 1 times the original message size. '
+                             'Higher values protect against longer burst errors but add more redundancy.')
     parser.add_argument('--max-error-ratio',
                         type=float, required=False, default=0.2,
-                        help='Maximum tolerable bit error ratio for error correction (0.0 to 1.0). '
+                        help='(DEPRECATED) Use --burst-error-tolerance instead. '
+                             'Maximum tolerable bit error ratio for error correction (0.0 to 1.0). '
                              'Default 0.2 means up to 20%% of bits can be corrected. '
                              'Higher values add more redundancy but allow more error recovery.')
     parser.set_defaults(random_generation=False)
@@ -74,6 +80,7 @@ class Options:
         relative_options_file_path : Optional[str] = None,
         random_generation : bool = False,
         max_error_ratio : float = 0.2,
+        burst_error_tolerance : int = 10,
     ) -> None:
         """
         Initializes the Options object with user-specified or default parameters.
@@ -88,8 +95,10 @@ class Options:
             output_directory_path: Directory to save outputs.
             relative_options_file_path: Path for options JSON file.
             random_generation: If True, generates random images without messages.
-            max_error_ratio: Maximum tolerable bit error ratio for error correction (0.0 to 1.0).
+            max_error_ratio: (DEPRECATED) Maximum tolerable bit error ratio for error correction (0.0 to 1.0).
                              Default 0.2 means up to 20% of bits can be corrected.
+            burst_error_tolerance: Maximum number of consecutive bit errors the error correction
+                                   can withstand. Default 10.
 
         Raises:
             ArgumentError: If required parameters are invalid.
@@ -110,6 +119,9 @@ class Options:
         self.relative_options_file_path = relative_options_file_path or "options.json"
         self.random_generation = random_generation
         self.max_error_ratio = max_error_ratio
+        # Convert max_error_ratio to burst_error_tolerance if the legacy parameter is used
+        # and burst_error_tolerance wasn't explicitly provided
+        self.burst_error_tolerance = burst_error_tolerance
 
     def save_as_file(self) -> None:
         """

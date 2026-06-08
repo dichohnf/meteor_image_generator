@@ -10,11 +10,10 @@ from tqdm.auto import tqdm
 from main import DataModuleFromConfig
 from scripts.input import Options
 from scripts.utils import bits2int, build_context_from_patches, int2bits, count_matching_bits_from_start, \
-    reset_seeds, save_image, string2bits, set_context
+    reset_seeds, save_image, set_context
 from scripts.utils import PATCH_SIZE, DEFAULT_CODEBOOK_SIZE, DEFAULT_PRECISION_BITS, DEFAULT_CONTEXT_ROWS
 from scripts.logger import logger
 from scripts.stats import EncodingStatistics
-from scripts.error_correction import ErrorCorrectionCode
 
 
 class SteganographyEncoder:
@@ -22,6 +21,10 @@ class SteganographyEncoder:
     Handles the encoding of secret messages into images using arithmetic coding and VQGAN.
     This class manages the process of selecting appropriate codebook tokens for each image patch
     to embed message bits while maintaining visual fidelity.
+
+    The encoder operates purely on raw bit strings. Any string-level transformations
+    (XOR masking, character encoding, error correction) must be applied externally
+    via ``SteganoPipeline`` before passing bits to this class.
     """
 
     def __init__(
@@ -29,7 +32,6 @@ class SteganographyEncoder:
         model: torch.nn.Module,
         dsets: DataModuleFromConfig,
         context_fraction: float = DEFAULT_CONTEXT_ROWS,
-        error_correction: Optional[ErrorCorrectionCode] = None,
     ):
         """
         Initializes the encoder with the VQGAN model, dataset, and context fraction.
@@ -38,13 +40,10 @@ class SteganographyEncoder:
             model: The trained VQGAN transformer model for generating image patches.
             dsets: The dataset configuration containing reference images.
             context_fraction: Fraction of the image used as context for generation.
-            error_correction: Optional ErrorCorrectionCode instance for adding redundancy
-                              to message bits before encoding. If None, no error correction is applied.
         """
         self.model = model
         self.dsets = dsets
         self.context_fraction = context_fraction
-        self.error_correction = error_correction
 
     @torch.no_grad()
     def select_token_for_patch(
@@ -166,14 +165,16 @@ class SteganographyEncoder:
         return next_row, next_col, selected_idx, encoded_length, range_bottom, range_top, encoded_bits_str
 
     @torch.no_grad()
-    def encode_message_to_image(self, message: str, random_sample: bool = False) -> Tuple[torch.Tensor, str, List[int], torch.Tensor, EncodingStatistics]:
+    def encode_message_to_image(self, encoded_bits: str, random_sample: bool = False) -> Tuple[torch.Tensor, str, List[int], torch.Tensor, EncodingStatistics]:
         """
-        Encodes a text message into a generated image tensor using steganography.
-        Processes the message bit by bit, embedding it into the image patches.
-        Also collects and returns detailed statistics about the encoding process.
+        Encodes a pre-processed bit string into a generated image tensor using steganography.
+
+        This method accepts already-transformed bits (e.g. from ``SteganoPipeline``).
+        It does **not** perform string-to-bits conversion or error correction internally;
+        those must be applied externally before calling this method.
 
         Args:
-            message: The text message to hide in the image.
+            encoded_bits: The bit string (``"0101..."``) to embed into the image.
             random_sample: If True, generates a random image without embedding the message.
 
         Returns:
@@ -194,18 +195,7 @@ class SteganographyEncoder:
         current_row = half_start // grid_shape[1]
         current_col = half_start % grid_shape[1]
 
-        # Apply error correction encoding if configured
-        if self.error_correction is not None:
-            original_bits = string2bits(message)
-            remaining_bits = self.error_correction.encode(original_bits)
-            logger.info(
-                f"Error correction enabled: message {len(original_bits)} original bits -> "
-                f"{len(remaining_bits)} encoded bits "
-                f"(overhead_ratio={self.error_correction.overhead_ratio})"
-            )
-        else:
-            remaining_bits = string2bits(message)
-
+        remaining_bits = encoded_bits
         indices_sequence = []
         stats = EncodingStatistics()
         patch_index = 0
@@ -252,7 +242,7 @@ class SteganographyEncoder:
                     patch_index += 1
 
         output_image = self.model.decode_to_img(building_tensor.unsqueeze(0), image_translations.shape).squeeze()
-        return output_image, string2bits(message), indices_sequence, building_tensor, stats
+        return output_image, encoded_bits, indices_sequence, building_tensor, stats
 
 
 def encode_message_to_image(

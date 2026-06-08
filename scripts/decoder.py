@@ -8,11 +8,10 @@ from tqdm.auto import tqdm
 
 from main import DataModuleFromConfig
 from scripts.input import Options
-from scripts.utils import (DEFAULT_CONTEXT_ROWS, set_context, bits2string, int2bits, build_context_from_patches,
+from scripts.utils import (DEFAULT_CONTEXT_ROWS, set_context, int2bits, build_context_from_patches,
                            DEFAULT_PRECISION_BITS, DEFAULT_CODEBOOK_SIZE, PATCH_SIZE)
 from scripts.logger import logger
 from scripts.stats import DecodingStatistics
-from scripts.error_correction import ErrorCorrectionCode
 
 
 def load_image(path: str) -> torch.Tensor:
@@ -26,6 +25,10 @@ class SteganographyDecoder:
     """
     Handles the decoding of hidden messages from steganographic images using arithmetic coding.
     This class extracts embedded bits from image patches and reconstructs the original message.
+
+    The decoder returns raw bit strings only. Any string-level transformations
+    (XOR unmasking, error correction decoding, bits-to-string conversion) must be applied
+    externally via ``SteganoPipeline`` after calling this decoder.
     """
 
     def __init__(
@@ -33,7 +36,6 @@ class SteganographyDecoder:
         model: torch.nn.Module,
         dsets: DataModuleFromConfig,
         context_fraction: float = DEFAULT_CONTEXT_ROWS,
-        error_correction: Optional[ErrorCorrectionCode] = None,
     ):
         """
         Initializes the decoder with the VQGAN model, dataset, and context fraction.
@@ -42,15 +44,10 @@ class SteganographyDecoder:
             model: The trained VQGAN transformer model for analyzing image patches.
             dsets: The dataset configuration containing reference images.
             context_fraction: Fraction of the image used as context for decoding.
-            error_correction: Optional ErrorCorrectionCode instance for correcting bit errors
-                              that may have been introduced during the VQGAN re-encoding process.
-                              Must be the same instance used during encoding. If None, no error
-                              correction is applied.
         """
         self.model = model
         self.dsets = dsets
         self.context_fraction = context_fraction
-        self.error_correction = error_correction
 
     @torch.no_grad()
     def decode_token_from_patch(
@@ -187,6 +184,9 @@ class SteganographyDecoder:
     ) -> Tuple[str, str, List[int], DecodingStatistics]:
         """
         Decodes the hidden message from a steganographic image tensor.
+        Returns raw embedded bits — any string-level or error-correction
+        transformations must be applied externally via ``SteganoPipeline``.
+
         Also collects and returns detailed statistics about the decoding process.
 
         Args:
@@ -194,7 +194,7 @@ class SteganographyDecoder:
             image: The stego-image tensor to decode.
 
         Returns:
-            Tuple of (decoded_text, decoded_bits, selected_indices, decoding_statistics).
+            Tuple of (raw_bits, raw_bits, selected_indices, decoding_statistics).
         """
         base_tensor, cond_tensor = set_context(self.model, self.dsets, DEFAULT_CONTEXT_ROWS)
 
@@ -246,17 +246,7 @@ class SteganographyDecoder:
                 pbar.update(1)
                 patch_index += 1
 
-        # Apply error correction decoding if configured
-        if self.error_correction is not None:
-            corrected_bits = self.error_correction.decode(decoded_bits)
-            logger.info(
-                f"Error correction decoding applied: {len(decoded_bits)} raw bits -> "
-                f"{len(corrected_bits)} corrected bits"
-            )
-            decoded_text = bits2string(corrected_bits)
-            return decoded_text, corrected_bits, selected_indices, stats
-
-        return bits2string(decoded_bits), decoded_bits, selected_indices, stats
+        return decoded_bits, decoded_bits, selected_indices, stats
 
 
 def decode_message(
@@ -264,7 +254,7 @@ def decode_message(
         model: torch.nn.Module,
         dsets: DataModuleFromConfig,
         image: torch.Tensor
-) -> Tuple[str, str, List[int]]:
+) -> Tuple[str, str, List[int], DecodingStatistics]:
     """
     Convenience function to decode a message from an image using the SteganographyDecoder class.
 
@@ -275,7 +265,7 @@ def decode_message(
         image: The image to decode.
 
     Returns:
-        Tuple of (decoded_text, decoded_bits, indices).
+        Tuple of (decoded_bits, decoded_bits, indices, stats).
     """
     decoder = SteganographyDecoder(model, dsets, context_fraction=options.context_fraction)
     return decoder.decode_message(options, image)

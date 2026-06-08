@@ -71,6 +71,15 @@ def initialized_parser() -> ArgumentParser:
                              'Can correct up to nsym // 2 erroneous bytes. '
                              'Only used when --error-correction-method=reed_solomon. '
                              'Default: 10.')
+    parser.add_argument('--xor-key',
+                        type=int, required=False, default=None,
+                        help='Optional integer key (0-255) for XOR obfuscation of the '
+                             'bit stream. If not set, no XOR masking is applied.')
+    parser.add_argument('--char-encoding',
+                        type=str, required=False, default='ASCII',
+                        choices=['ASCII', 'UNICODE', 'DECIMAL'],
+                        help='Character encoding for str↔bits conversion. '
+                             'Default: "ASCII".')
     parser.set_defaults(random_generation=False)
     return parser
 

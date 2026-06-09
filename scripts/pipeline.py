@@ -2,7 +2,7 @@
 Steganographic pipeline for message transformation.
 
 Chains together all string-level transformations independently from the
-VQGAN image encoding/decoding:
+VQGAN image encoding/decoding::
 
     encode:  message (str) → XOR + CharToBits + ErrorCorrection → bits (str)
     decode:  bits (str)    → ErrorCorrection + BitsToChar + XOR → message (str)
@@ -11,7 +11,7 @@ The pipeline is self-contained: the encoder/decoder receive/return raw bits
 and never see the internals of the pipeline.
 """
 
-from typing import Optional
+from typing import Optional, Dict, Any, Tuple
 
 from scripts.error_correction import ErrorCorrectionFactory, ErrorCorrectionCode
 from scripts.logger import logger
@@ -122,64 +122,143 @@ class SteganoPipeline:
         )
 
     # ------------------------------------------------------------------
-    #  Public API
+    #  Public API — standard
     # ------------------------------------------------------------------
 
     def encode_message(self, message: str) -> str:
         """
         Full forward transformation: plain text → protected bit string.
 
-        Order: XOR (optional) → str→bits → ECC encode.
+        Order: str→bits → XOR (optional) → ECC encode.
         """
         if not message:
             return ""
-
-        # XOR at the string level (before bits) for conceptual clarity,
-        # but we implement it on bits so the same key works uniformly.
-        # Actually, XOR on raw string characters is less robust; we do it
-        # on the bit stream for consistent per-bit obfuscation.
-        bits = string2bits(message, code=self.char_encoding)
-        logger.info(
-            f"[Pipeline] encode: message={len(message)} chars "
-            f"→ {len(bits)} raw bits"
-        )
-
-        if self.xor_mask is not None:
-            bits = self.xor_mask.apply(bits)
-            logger.info(f"[Pipeline] XOR applied ({len(bits)} bits)")
-
-        bits = self.ecc.encode(bits)
-        logger.info(
-            f"[Pipeline] ECC encode → {len(bits)} protected bits"
-        )
-        return bits
+        trace, _ = self._encode_with_trace(message)
+        return trace[-1][1] if trace else ""
 
     def decode_message(self, bits: str) -> str:
         """
         Full reverse transformation: protected bit string → plain text.
 
-        Order: ECC decode → bits→str → XOR (optional).
+        Order: ECC decode → XOR (optional) → bits→str.
         """
         if not bits:
             return ""
+        _, message = self._decode_with_trace(bits)
+        return message
 
-        # Step 1: error correction
+    # ------------------------------------------------------------------
+    #  Public API — with trace (for statistics)
+    # ------------------------------------------------------------------
+
+    def encode_message_with_trace(self, message: str) -> Tuple[str, Dict[str, Any]]:
+        """
+        Like :meth:`encode_message` but also returns a trace dict with
+        the intermediate bit strings at each pipeline step.
+
+        Returns:
+            Tuple of (protected_bits, trace_dict).
+            The trace dict has keys:
+              - ``"raw_bits"``       – output of str→bits conversion
+              - ``"xor_bits"``       – after XOR masking (omitted if XOR is off)
+              - ``"protected_bits"`` – after ECC encode (final output)
+        """
+        if not message:
+            return "", {}
+        trace, _ = self._encode_with_trace(message)
+        protected = trace[-1][1] if trace else ""
+        trace_dict = {label: bits for label, bits in trace}
+        return protected, trace_dict
+
+    def decode_message_with_trace(self, bits: str) -> Tuple[str, Dict[str, Any]]:
+        """
+        Like :meth:`decode_message` but also returns a trace dict with
+        the intermediate bit strings at each pipeline step.
+
+        Returns:
+            Tuple of (recovered_message, trace_dict).
+            The trace dict has keys:
+              - ``"ecc_output_bits"``  – after ECC decode
+              - ``"xor_output_bits"``  – after XOR undo (omitted if XOR is off)
+              - ``"recovered_bits"``   – bits fed to bits→str conversion
+              - ``"recovered_text"``   – final decoded string
+        """
+        if not bits:
+            return "", {}
+        trace, message = self._decode_with_trace(bits)
+        trace_dict = {}
+        for label, bits_val in trace:
+            trace_dict[label] = bits_val
+        trace_dict["recovered_text"] = message
+        return message, trace_dict
+
+    # ------------------------------------------------------------------
+    #  Internal trace helpers
+    # ------------------------------------------------------------------
+
+    def _encode_with_trace(self, message: str) -> Tuple[list, str]:
+        """
+        Run encode_message step-by-step and record each intermediate.
+
+        Returns:
+            Tuple of (trace_list, final_bits).
+            trace_list is a list of ``(step_label, bit_string)`` tuples.
+        """
+        trace = []
+
+        # Step 1: str → bits
+        bits = string2bits(message, code=self.char_encoding)
+        logger.info(
+            f"[Pipeline] encode: message={len(message)} chars "
+            f"→ {len(bits)} raw bits"
+        )
+        trace.append(("raw_bits", bits))
+
+        # Step 2: XOR (optional)
+        if self.xor_mask is not None:
+            bits = self.xor_mask.apply(bits)
+            logger.info(f"[Pipeline] XOR applied ({len(bits)} bits)")
+            trace.append(("xor_bits", bits))
+
+        # Step 3: ECC encode
+        bits = self.ecc.encode(bits)
+        logger.info(
+            f"[Pipeline] ECC encode → {len(bits)} protected bits"
+        )
+        trace.append(("protected_bits", bits))
+
+        return trace, bits
+
+    def _decode_with_trace(self, bits: str) -> Tuple[list, str]:
+        """
+        Run decode_message step-by-step and record each intermediate.
+
+        Returns:
+            Tuple of (trace_list, recovered_message).
+        """
+        trace = []
+
+        # Step 1: ECC decode
         corrected = self.ecc.decode(bits)
         logger.info(
             f"[Pipeline] ECC decode → {len(corrected)} bits"
         )
+        trace.append(("ecc_output_bits", corrected))
 
-        # Step 2: undo XOR (if enabled)
+        # Step 2: XOR undo (optional)
         if self.xor_mask is not None:
             corrected = self.xor_mask.apply(corrected)
             logger.info(f"[Pipeline] XOR reversed ({len(corrected)} bits)")
+            trace.append(("xor_output_bits", corrected))
 
         # Step 3: bits → string
+        trace.append(("recovered_bits", corrected))
         message = bits2string(corrected, code=self.char_encoding)
         logger.info(
             f"[Pipeline] decode → {len(message)} chars"
         )
-        return message
+
+        return trace, message
 
     def __repr__(self) -> str:
         return (

@@ -108,8 +108,8 @@ def main():
     encoder = SteganographyEncoder(model, dsets, context_fraction=options.context_fraction)
     decoder = SteganographyDecoder(model, dsets, context_fraction=options.context_fraction)
 
-    # Pre-compute the protected bit string once for all encoding runs
-    protected_bits = pipeline.encode_message(options.message)
+    # Pre-compute the pipeline trace and protected bits once for all encoding runs
+    protected_bits, encode_trace = pipeline.encode_message_with_trace(options.message)
     logger.info(
         f"Protected bits prepared: {len(protected_bits)} bits "
         f"(from {len(options.message)} chars)"
@@ -143,6 +143,8 @@ def main():
                 decoded_indices=[],
                 recovered_text="",
                 decoding_stats=DecodingStatistics(),
+                encode_trace=encode_trace,
+                decode_trace=None,
                 options_dict=options_dict,
                 pipeline_info=pipeline_info,
                 seed=options.seed,
@@ -189,7 +191,7 @@ def main():
 
             # Decoder returns raw bits — run them through the pipeline to recover the string
             raw_bits, _, decoded_indices, decoding_stats = decoder.decode_message(options, image)
-            recovered_text = pipeline.decode_message(raw_bits)
+            recovered_text, decode_trace = pipeline.decode_message_with_trace(raw_bits)
 
             # Build stats file path and retrieve the matching encoding data
             stats_file = image_path.rsplit(".", 1)[0] + "_stats.json"
@@ -210,6 +212,8 @@ def main():
                 decoded_indices=list(decoded_indices),
                 recovered_text=recovered_text,
                 decoding_stats=decoding_stats,
+                encode_trace=encode_trace,
+                decode_trace=decode_trace,
                 options_dict=options_dict,
                 pipeline_info=pipeline_info,
                 seed=options.seed,

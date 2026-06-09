@@ -122,6 +122,10 @@ class StatsWriter:
         recovered_text: str,
         decoding_stats: DecodingStatistics,
         # Metadata
+        # Pipeline trace
+        encode_trace: Optional[Dict[str, str]] = None,
+        decode_trace: Optional[Dict[str, str]] = None,
+        # Metadata
         options_dict: Optional[Dict[str, Any]] = None,
         pipeline_info: Optional[Dict[str, Any]] = None,
         seed: Optional[int] = None,
@@ -161,6 +165,10 @@ class StatsWriter:
             },
             "options": options_dict or {},
             "pipeline": pipeline_info or {},
+            "pipeline_trace": {
+                "encode": encode_trace or {},
+                "decode": decode_trace or {},
+            },
             "seed": seed,
             "encoding": {
                 "bits": encoded_bits,

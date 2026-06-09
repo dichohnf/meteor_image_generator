@@ -4,7 +4,7 @@ Tracks metrics for both encoder and decoder to enable analysis of the process.
 All stats are consolidated into a single JSON file per image.
 """
 import json
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from pathlib import Path
 
 
@@ -70,6 +70,93 @@ class DecodingStatistics:
             "successful_patches": successful_patches,
             "patches": self.patches
         }
+
+
+def _merge_patches(
+    encoding_patches: List[Dict[str, Any]],
+    decoding_patches: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Merge encoding and decoding per-patch stats into a single list where each
+    entry contains both the encoding and decoding info for that patch.
+
+    Encoding and decoding both iterate patches in the same raster-scan order,
+    so they are merged by position (row, col) rather than by index alone.
+
+    Parameters:
+        encoding_patches: List of per-patch dicts from EncodingStatistics.
+        decoding_patches: List of per-patch dicts from DecodingStatistics.
+
+    Returns:
+        A list of merged dicts, each with:
+          - ``patch_index``, ``row``, ``col``
+          - ``encoding``: encoding-specific fields (or ``null`` if patch was
+            not used for encoding — e.g. random fill patches)
+          - ``decoding``: decoding-specific fields
+    """
+    # Build a lookup from (row, col) → encoding entry
+    enc_by_pos: Dict[Tuple[int, int], Dict[str, Any]] = {
+        (p["row"], p["col"]): p for p in encoding_patches
+    }
+
+    merged = []
+    for dec_patch in decoding_patches:
+        key = (dec_patch["row"], dec_patch["col"])
+        enc_patch = enc_by_pos.pop(key, None)
+
+        entry = {
+            "patch_index": dec_patch.get("patch_index", dec_patch["patch_index"]),
+            "row": dec_patch["row"],
+            "col": dec_patch["col"],
+        }
+
+        if enc_patch is not None:
+            entry["encoding"] = {
+                "selected_codebook_index": enc_patch["selected_codebook_index"],
+                "probability_range": {
+                    "bottom": enc_patch["probability_range"]["bottom"],
+                    "top": enc_patch["probability_range"]["top"],
+                },
+                "encoded_bits": enc_patch["encoded_bits"],
+                "message_bits_encoded": enc_patch["message_bits_encoded"],
+            }
+        else:
+            entry["encoding"] = None
+
+        entry["decoding"] = {
+            "actual_token": dec_patch["actual_token"],
+            "probability_range": {
+                "bottom": dec_patch["probability_range"]["bottom"],
+                "top": dec_patch["probability_range"]["top"],
+            },
+            "decoded_bits": dec_patch["decoded_bits"],
+            "success": dec_patch["success"],
+        }
+
+        merged.append(entry)
+
+    # Add any remaining encoding-only patches (shouldn't happen, but be safe)
+    for enc_patch in enc_by_pos.values():
+        entry = {
+            "patch_index": enc_patch["patch_index"],
+            "row": enc_patch["row"],
+            "col": enc_patch["col"],
+            "encoding": {
+                "selected_codebook_index": enc_patch["selected_codebook_index"],
+                "probability_range": {
+                    "bottom": enc_patch["probability_range"]["bottom"],
+                    "top": enc_patch["probability_range"]["top"],
+                },
+                "encoded_bits": enc_patch["encoded_bits"],
+                "message_bits_encoded": enc_patch["message_bits_encoded"],
+            },
+            "decoding": None,
+        }
+        merged.append(entry)
+
+    # Sort by (row, col) for deterministic order
+    merged.sort(key=lambda e: (e["row"], e["col"]))
+    return merged
 
 
 def _build_bit_comparison(encoded_bits: str, decoded_bits: str) -> List[Dict[str, Any]]:
@@ -150,6 +237,17 @@ class StatsWriter:
         # Build the paired bit-comparison list
         bit_comparison = _build_bit_comparison(encoded_bits, decoded_bits)
         
+        # Merge encoding and decoding per-patch data into a single list
+        enc_patch_list = encoding_stats.to_dict()
+        dec_patch_list = decoding_stats.to_dict()
+        merged_patches = _merge_patches(
+            enc_patch_list.get("patches", []),
+            dec_patch_list.get("patches", []),
+        )
+        total_patches_for_encoding = enc_patch_list.get("total_patches_encoded", 0)
+        total_patches_decoded = dec_patch_list.get("total_patches_decoded", 0)
+        successful_patches = dec_patch_list.get("successful_patches", 0)
+        
         # Count errors (where both sides exist and differ)
         mismatches = [b for b in bit_comparison if b["match"] is False]
         error_count = len(mismatches)
@@ -175,16 +273,18 @@ class StatsWriter:
                 "total_bits": len(encoded_bits),
                 "indices": encoded_indices,
                 "total_indices": len(encoded_indices),
-                "per_patch": encoding_stats.to_dict(),
+                "total_patches_encoded": total_patches_for_encoding,
             },
             "decoding": {
                 "bits": decoded_bits,
                 "total_bits": len(decoded_bits),
                 "indices": decoded_indices,
                 "total_indices": len(decoded_indices),
+                "total_patches_decoded": total_patches_decoded,
+                "successful_patches": successful_patches,
                 "recovered_text": recovered_text,
-                "per_patch": decoding_stats.to_dict(),
             },
+            "per_patch": merged_patches,
             "bit_comparison": {
                 "total_bits_compared": total_compared,
                 "error_count": error_count,

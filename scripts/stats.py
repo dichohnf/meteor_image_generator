@@ -1,9 +1,10 @@
 """
 Statistics collection and reporting for steganography encoding and decoding.
 Tracks metrics for both encoder and decoder to enable analysis of the process.
+All stats are consolidated into a single JSON file per image.
 """
 import json
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from pathlib import Path
 
 
@@ -71,87 +72,124 @@ class DecodingStatistics:
         }
 
 
+def _build_bit_comparison(encoded_bits: str, decoded_bits: str) -> List[Dict[str, Any]]:
+    """
+    Build a single list pairing encoded and decoded bits for easy comparison.
+    
+    Each entry contains:
+      - index: bit position
+      - encoded: the encoded bit value ('0' or '1')
+      - decoded: the decoded bit value ('0' or '1')
+      - match: whether encoded and decoded match
+    
+    For bits beyond the shorter sequence, the missing side is marked as None.
+    """
+    max_len = max(len(encoded_bits), len(decoded_bits))
+    comparison = []
+    for i in range(max_len):
+        enc = encoded_bits[i] if i < len(encoded_bits) else None
+        dec = decoded_bits[i] if i < len(decoded_bits) else None
+        comparison.append({
+            "index": i,
+            "encoded": enc,
+            "decoded": dec,
+            "match": enc == dec if (enc is not None and dec is not None) else None
+        })
+    return comparison
+
+
 class StatsWriter:
-    """Writes encoding and decoding statistics to a JSON file."""
+    """Writes consolidated encoding and decoding statistics to a JSON file.
+    
+    All auxiliary data (bits, indices, texts) are stored in the single JSON
+    file, eliminating separate .txt files.  Encoded and decoded bits are
+    presented as a single paired list for easy visual comparison.
+    """
     
     @staticmethod
-    def write_stats(filepath: str, message: str, 
-                   encoded_bits: str, decoded_text: str, decoded_bits: str,
-                   encoding_stats: EncodingStatistics, 
-                   decoding_stats: DecodingStatistics = None):
+    def write_consolidated(
+        filepath: str,
+        *,
+        # Original message
+        original_message: str,
+        # Encoded data
+        encoded_bits: str,
+        encoded_indices: List[int],
+        encoding_stats: EncodingStatistics,
+        # Decoded data
+        decoded_bits: str,
+        decoded_indices: List[int],
+        recovered_text: str,
+        decoding_stats: DecodingStatistics,
+        # Metadata
+        options_dict: Optional[Dict[str, Any]] = None,
+        pipeline_info: Optional[Dict[str, Any]] = None,
+        seed: Optional[int] = None,
+    ) -> None:
         """
-        Write complete statistics to a JSON file.
+        Write a single consolidated statistics JSON file for one image.
         
         Args:
-            filepath: Path to output JSON file
-            message: Original message encoded
-            encoded_bits: Bit representation of the message
-            decoded_text: Decoded message from the image
-            decoded_bits: Bits decoded from the image
-            encoding_stats: EncodingStatistics object with patch-level data
-            decoding_stats: Optional DecodingStatistics object with patch-level data
+            filepath: Path to output JSON file.
+            original_message: The original plain-text message.
+            encoded_bits: Bit string after pipeline encoding (protected bits).
+            encoded_indices: List of codebook indices selected during encoding.
+            encoding_stats: EncodingStatistics with per-patch data.
+            decoded_bits: Bit string from the decoder (raw bits).
+            decoded_indices: List of codebook indices recovered during decoding.
+            recovered_text: Plain-text message recovered after pipeline decoding.
+            decoding_stats: DecodingStatistics with per-patch data.
+            options_dict: Optional dict of Options attributes for provenance.
+            pipeline_info: Optional dict describing the pipeline configuration.
+            seed: The random seed used for this run.
         """
+        # Build the paired bit-comparison list
+        bit_comparison = _build_bit_comparison(encoded_bits, decoded_bits)
+        
+        # Count errors (where both sides exist and differ)
+        mismatches = [b for b in bit_comparison if b["match"] is False]
+        error_count = len(mismatches)
+        total_compared = sum(1 for b in bit_comparison if b["match"] is not None)
+        error_ratio = error_count / total_compared if total_compared > 0 else 0.0
+        
+        # Determine match result
+        message_match = original_message == recovered_text if recovered_text else False
+        
         stats_data = {
             "message": {
-                "original": message,
-                "encoded_bits": encoded_bits,
-                "total_bits_encoded": len(encoded_bits)
+                "original": original_message,
             },
-            "encoding": encoding_stats.to_dict(),
-            "decoding": decoding_stats.to_dict() if decoding_stats else None,
+            "options": options_dict or {},
+            "pipeline": pipeline_info or {},
+            "seed": seed,
+            "encoding": {
+                "bits": encoded_bits,
+                "total_bits": len(encoded_bits),
+                "indices": encoded_indices,
+                "total_indices": len(encoded_indices),
+                "per_patch": encoding_stats.to_dict(),
+            },
+            "decoding": {
+                "bits": decoded_bits,
+                "total_bits": len(decoded_bits),
+                "indices": decoded_indices,
+                "total_indices": len(decoded_indices),
+                "recovered_text": recovered_text,
+                "per_patch": decoding_stats.to_dict(),
+            },
+            "bit_comparison": {
+                "total_bits_compared": total_compared,
+                "error_count": error_count,
+                "error_ratio": error_ratio,
+                "pairs": bit_comparison,
+            },
             "result": {
-                "decoded_message": decoded_text,
-                "decoded_bits": decoded_bits,
-                "total_bits_decoded": len(decoded_bits),
-                "match": message == decoded_text if decoded_text else False
-            }
+                "message_match": message_match,
+            },
         }
         
         # Create directory if it doesn't exist
         Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(filepath, 'w') as f:
-            json.dump(stats_data, f, indent=2)
-    
-    @staticmethod
-    def write_encoding_only(filepath: str, message: str,
-                          encoded_bits: str,
-                          encoding_stats: EncodingStatistics):
-        """Write encoding statistics only (before decoding)."""
-        stats_data = {
-            "message": {
-                "original": message,
-                "encoded_bits": encoded_bits,
-                "total_bits_encoded": len(encoded_bits)
-            },
-            "encoding": encoding_stats.to_dict(),
-            "decoding": None,
-            "result": None
-        }
-        
-        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(filepath, 'w') as f:
-            json.dump(stats_data, f, indent=2)
-    
-    @staticmethod
-    def append_decoding_stats(filepath: str, decoded_text: str, decoded_bits: str,
-                            decoding_stats: DecodingStatistics, 
-                            original_message: str):
-        """Update stats file with decoding results."""
-        try:
-            with open(filepath, 'r') as f:
-                stats_data = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            stats_data = {}
-        
-        stats_data["decoding"] = decoding_stats.to_dict()
-        stats_data["result"] = {
-            "decoded_message": decoded_text,
-            "decoded_bits": decoded_bits,
-            "total_bits_decoded": len(decoded_bits),
-            "match": original_message == decoded_text if decoded_text else False
-        }
         
         with open(filepath, 'w') as f:
             json.dump(stats_data, f, indent=2)

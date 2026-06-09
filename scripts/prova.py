@@ -14,8 +14,47 @@ from scripts.decoder import SteganographyDecoder, load_image
 from scripts.encoder import SteganographyEncoder
 from scripts.input import Options, initialized_parser
 from scripts.utils import get_vqgan_sflckr, reset_seeds, save_image
-from scripts.stats import StatsWriter
+from scripts.stats import StatsWriter, EncodingStatistics, DecodingStatistics
 from scripts.pipeline import build_pipeline_from_options
+
+
+def _options_to_dict(options: Options) -> dict:
+    """Serialize relevant Options fields to a plain dict for JSON."""
+    return {
+        "message": options.message,
+        "model_directory_path": options.model_directory_path,
+        "context_fraction": options.context_fraction,
+        "quiet": options.quiet,
+        "seed": options.seed,
+        "to_gen_number": options.to_gen_number,
+        "output_directory": options.output_directory,
+        "random_generation": options.random_generation,
+        "max_error_ratio": options.max_error_ratio,
+        "burst_error_tolerance": options.burst_error_tolerance,
+        "error_correction_method": options.error_correction_method,
+        "rs_nsym": options.rs_nsym,
+    }
+
+
+def _pipeline_to_dict(pipeline) -> dict:
+    """Serialize pipeline configuration to a plain dict for JSON."""
+    info = {
+        "char_encoding": pipeline.char_encoding,
+        "ecc_method": type(pipeline.ecc).__name__,
+    }
+    if pipeline.xor_mask is not None:
+        info["xor_key"] = pipeline.xor_mask.key
+    else:
+        info["xor_key"] = None
+
+    # Include ECC-specific parameters
+    ecc = pipeline.ecc
+    if hasattr(ecc, "burst_error_tolerance"):
+        info["burst_error_tolerance"] = ecc.burst_error_tolerance
+    if hasattr(ecc, "nsym"):
+        info["rs_nsym"] = ecc.nsym
+
+    return info
 
 
 def main():
@@ -26,6 +65,9 @@ def main():
 
     The pipeline (XOR → char encoding → error correction) is applied externally from the
     VQGAN encoder/decoder, which operate on raw bits only.
+
+    All statistics (bits, indices, per-patch data) are written into a single consolidated
+    JSON file per image — no auxiliary .txt files are produced.
     """
     parser = initialized_parser()
     args = parser.parse_args()
@@ -73,6 +115,10 @@ def main():
         f"(from {len(options.message)} chars)"
     )
 
+    # Pre-compute metadata dicts (same for all images in this run)
+    options_dict = _options_to_dict(options)
+    pipeline_info = _pipeline_to_dict(pipeline)
+
     # ============================================================
     #  Random generation (no message embedded)
     # ============================================================
@@ -86,18 +132,29 @@ def main():
             path = os.path.join(options.output_directory, "random", f"rand_{i:03}")
             os.makedirs(os.path.dirname(path), exist_ok=True)
             save_image(generated_image, path)
-            with open(path + "_encoded_bits.txt", "x") as f:
-                f.write(bits_string)
-            with open(path + "_encoded_indices.txt", "x") as f:
-                f.write(np.array2string(np.array(indices_sequence), suppress_small=True))
-            stats_file = path + "_stats.json"
-            StatsWriter.write_encoding_only(stats_file, options.message, bits_string, encoding_stats)
+
+            StatsWriter.write_consolidated(
+                path + "_stats.json",
+                original_message=options.message,
+                encoded_bits=bits_string,
+                encoded_indices=list(indices_sequence),
+                encoding_stats=encoding_stats,
+                decoded_bits="",
+                decoded_indices=[],
+                recovered_text="",
+                decoding_stats=DecodingStatistics(),
+                options_dict=options_dict,
+                pipeline_info=pipeline_info,
+                seed=options.seed,
+            )
 
     # ============================================================
     #  Encode message into images (deterministic, seed-controlled)
+    #  Store per-image encoding data for later consolidation
     # ============================================================
     reset_seeds(options.seed)
     logger.info("Starting message encoding into images...")
+    encoding_data_list = []
     for i in range(options.to_gen_number):
         generated_image, bits_string, indices_sequence, building_tensor, encoding_stats = encoder.encode_message_to_image(
             protected_bits, random_sample=False
@@ -105,12 +162,12 @@ def main():
         path = os.path.join(options.output_directory, "meteor", f"rand_{i:03}")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         save_image(generated_image, path)
-        with open(path + "_encoded_bits.txt", "x") as f:
-            f.write(bits_string)
-        with open(path + "_encoded_indices.txt", "x") as f:
-            f.write(np.array2string(np.array(indices_sequence), suppress_small=True))
-        stats_file = path + "_stats.json"
-        StatsWriter.write_encoding_only(stats_file, options.message, bits_string, encoding_stats)
+        encoding_data_list.append({
+            "bits_string": bits_string,
+            "indices_sequence": list(indices_sequence),
+            "encoding_stats": encoding_stats,
+            "stats_file": path + "_stats.json",
+        })
 
     # ============================================================
     #  Decode all generated images and recover the message
@@ -123,7 +180,7 @@ def main():
     reset_seeds(options.seed)
     logger.info("Starting message decoding from generated images...")
     for root, _, files in os.walk(meteor_path):
-        for filename in files:
+        for filename in sorted(files):
             if not filename.lower().endswith((".png", ".jpg", ".jpeg")):
                 continue
 
@@ -134,19 +191,29 @@ def main():
             raw_bits, _, decoded_indices, decoding_stats = decoder.decode_message(options, image)
             recovered_text = pipeline.decode_message(raw_bits)
 
-            image_name, _ = os.path.splitext(filename)
-            with open(os.path.join(root, f"{image_name}_decoded_bits.txt"), "x") as f:
-                f.write(raw_bits)
-            with open(os.path.join(root, f"{image_name}_decoded_indices.txt"), "x") as f:
-                f.write(np.array2string(np.array(decoded_indices), suppress_small=True))
-
-            # Append decoding stats to the existing stats file
+            # Build stats file path and retrieve the matching encoding data
             stats_file = image_path.rsplit(".", 1)[0] + "_stats.json"
-            StatsWriter.append_decoding_stats(
-                stats_file, recovered_text, raw_bits, decoding_stats, options.message
+
+            # Extract run index from filename (e.g. "rand_002" -> 2)
+            stem = os.path.splitext(filename)[0]
+            gen_index = int(stem.split("_")[-1])
+
+            enc_data = encoding_data_list[gen_index]
+
+            StatsWriter.write_consolidated(
+                stats_file,
+                original_message=options.message,
+                encoded_bits=enc_data["bits_string"],
+                encoded_indices=enc_data["indices_sequence"],
+                encoding_stats=enc_data["encoding_stats"],
+                decoded_bits=raw_bits,
+                decoded_indices=list(decoded_indices),
+                recovered_text=recovered_text,
+                decoding_stats=decoding_stats,
+                options_dict=options_dict,
+                pipeline_info=pipeline_info,
+                seed=options.seed,
             )
-            with open(os.path.join(root, f"{image_name}_decoded_text.txt"), "x") as f:
-                f.write(recovered_text)
 
 
 if __name__ == '__main__':

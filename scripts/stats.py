@@ -37,6 +37,17 @@ class EncodingStatistics:
             "total_patches_encoded": len(self.patches),
             "patches": self.patches
         }
+    
+    def get_grid_shape(self) -> Optional[Tuple[int, int]]:
+        """Infer grid shape from patch positions."""
+        if not self.patches:
+            return None
+        rows = set()
+        cols = set()
+        for p in self.patches:
+            rows.add(p["row"])
+            cols.add(p["col"])
+        return (max(rows) + 1, max(cols) + 1)
 
 
 class DecodingStatistics:
@@ -70,6 +81,17 @@ class DecodingStatistics:
             "successful_patches": successful_patches,
             "patches": self.patches
         }
+    
+    def get_grid_shape(self) -> Optional[Tuple[int, int]]:
+        """Infer grid shape from patch positions."""
+        if not self.patches:
+            return None
+        rows = set()
+        cols = set()
+        for p in self.patches:
+            rows.add(p["row"])
+            cols.add(p["col"])
+        return (max(rows) + 1, max(cols) + 1)
 
 
 def _merge_patches(
@@ -157,6 +179,28 @@ def _merge_patches(
     # Sort by (row, col) for deterministic order
     merged.sort(key=lambda e: (e["row"], e["col"]))
     return merged
+
+
+def _list_to_matrix(indices: List[int], grid_shape: Tuple[int, int]) -> List[List[Optional[int]]]:
+    """
+    Reshape a flat list of indices into a 2D matrix (list of lists) of the
+    given grid shape. Indices are arranged in raster-scan order (row-major).
+    
+    If the list is shorter than ``h * w``, the remaining cells are filled
+    with ``None``. If longer, it is truncated to ``h * w``.
+    """
+    h, w = grid_shape
+    total_cells = h * w
+    # Truncate if longer than the grid, pad with None if shorter
+    flat: List[Optional[int]] = list(indices[:total_cells])
+    while len(flat) < total_cells:
+        flat.append(None)
+    matrix: List[List[Optional[int]]] = []
+    for r in range(h):
+        row_start = r * w
+        row_end = row_start + w
+        matrix.append(flat[row_start:row_end])
+    return matrix
 
 
 def _build_bit_comparison(encoded_bits: str, decoded_bits: str) -> List[Dict[str, Any]]:
@@ -257,7 +301,26 @@ class StatsWriter:
         # Determine match result
         message_match = original_message == recovered_text if recovered_text else False
         
+        # Determine grid shape from per-patch statistics
+        grid_shape = encoding_stats.get_grid_shape()
+        if grid_shape is None:
+            grid_shape = decoding_stats.get_grid_shape()
+        # Fallback: try to infer from merged patches
+        if grid_shape is None and merged_patches:
+            rows = set(p["row"] for p in merged_patches)
+            cols = set(p["col"] for p in merged_patches)
+            grid_shape = (max(rows) + 1, max(cols) + 1)
+        
+        # Reshape flat index lists into 2D matrices
+        if grid_shape is not None:
+            encoded_indices_grid = _list_to_matrix(encoded_indices, grid_shape)
+            decoded_indices_grid = _list_to_matrix(decoded_indices, grid_shape)
+        else:
+            encoded_indices_grid = []
+            decoded_indices_grid = []
+        
         stats_data = {
+            "grid_shape": list(grid_shape) if grid_shape else None,
             "message": {
                 "original": original_message,
             },
@@ -272,6 +335,7 @@ class StatsWriter:
                 "bits": encoded_bits,
                 "total_bits": len(encoded_bits),
                 "indices": encoded_indices,
+                "indices_grid": encoded_indices_grid,
                 "total_indices": len(encoded_indices),
                 "total_patches_encoded": total_patches_for_encoding,
             },
@@ -279,6 +343,7 @@ class StatsWriter:
                 "bits": decoded_bits,
                 "total_bits": len(decoded_bits),
                 "indices": decoded_indices,
+                "indices_grid": decoded_indices_grid,
                 "total_indices": len(decoded_indices),
                 "total_patches_decoded": total_patches_decoded,
                 "successful_patches": successful_patches,

@@ -15,7 +15,7 @@ from scripts.encoder import SteganographyEncoder
 from scripts.input import Options, initialized_parser
 from scripts.utils import get_vqgan_sflckr, reset_seeds, save_image
 from scripts.stats import StatsWriter, EncodingStatistics, DecodingStatistics
-from scripts.pipeline import build_pipeline_from_options
+from scripts.pipeline import build_pipeline_from_options, HEADER_LENGTH_BITS
 
 
 def _options_to_dict(options: Options) -> dict:
@@ -41,11 +41,9 @@ def _pipeline_to_dict(pipeline) -> dict:
     info = {
         "char_encoding": pipeline.char_encoding,
         "ecc_method": type(pipeline.ecc).__name__,
+        "xor_key": pipeline.xor_mask.key,
+        "header_burst_error_tolerance": pipeline.header_burst_error_tolerance,
     }
-    if pipeline.xor_mask is not None:
-        info["xor_key"] = pipeline.xor_mask.key
-    else:
-        info["xor_key"] = None
 
     # Include ECC-specific parameters
     ecc = pipeline.ecc
@@ -118,6 +116,13 @@ def main():
     # Pre-compute metadata dicts (same for all images in this run)
     options_dict = _options_to_dict(options)
     pipeline_info = _pipeline_to_dict(pipeline)
+
+    logger.info(
+        f"Protected bits prepared: {len(protected_bits)} bits "
+        f"(from {len(options.message)} chars). "
+        f"Vote-protected {HEADER_LENGTH_BITS}-bit header with "
+        f"tolerance={getattr(options, 'header_burst_error_tolerance', 10)}"
+    )
 
     # ============================================================
     #  Random generation (no message embedded)

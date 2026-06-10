@@ -269,6 +269,12 @@ class ReedSolomonCorrectionCode(ErrorCorrectionCode):
                 "Returning raw data (strip ECC)."
             )
             success = False
+            # Log diagnostic info
+            logger.warning(
+                f"[RS] decode diagnostic: rx_bytes={len(rx_bytes)}, "
+                f"nsym={self.nsym}, stripped={len(rx_bytes) - self.nsym}, "
+                f"first_bytes={' '.join(f'{b:02x}' for b in rx_bytes[:12])}"
+            )
             corrected_bytes = rx_bytes[:len(rx_bytes) - self.nsym]
 
         # Convert back to bits

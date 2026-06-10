@@ -4,8 +4,10 @@ Steganographic pipeline for message transformation.
 Chains together all string-level transformations independently from the
 VQGAN image encoding/decoding::
 
-    encode:  message (str) → CharToBits → LengthHeader(Vote) → XOR → ECC(RS) → bits (str)
-    decode:  bits (str)    → ECC(RS) → XOR → StripHeader(Vote) → BitsToChar → message (str)
+    encode:  message (str) → CharToBits → ECC(RS) on body → LengthHeader(Vote)
+             → header_vote + body_RS → XOR → bits (str)
+    decode:  bits (str)    → XOR undo → StripHeader(Vote) → body_RS → ECC(RS) on body
+             → BitsToChar → message (str)
 
 The pipeline is self-contained: the encoder/decoder receive/return raw bits
 and never see the internals of the pipeline.
@@ -50,12 +52,24 @@ def _decode_length_header(protected_header: str, burst_error_tolerance: int) -> 
         burst_error_tolerance: The burst error tolerance used during encoding.
 
     Returns:
-        The message length in bits.
+        The message length in bits, or 0 if the decoded length is invalid
+        (≤ 0 or > 2^HEADER_LENGTH_BITS - 1).
     """
     vote = VoteCorrectionCode(burst_error_tolerance=burst_error_tolerance)
     header_raw = vote.decode(protected_header)
     # In case decoding returns more bits than expected, take only the first 13
-    return int(header_raw[:HEADER_LENGTH_BITS], 2)
+    num_bits = int(header_raw[:HEADER_LENGTH_BITS], 2)
+
+    # Validate: length must be > 0 and ≤ max supported (8191)
+    max_bits = (1 << HEADER_LENGTH_BITS) - 1
+    if num_bits <= 0 or num_bits > max_bits:
+        logger.warning(
+            f"[Pipeline] _decode_length_header: invalid decoded length "
+            f"{num_bits} (max={max_bits})"
+        )
+        return 0
+
+    return num_bits
 
 
 # ======================================================================
@@ -100,11 +114,13 @@ class SteganoPipeline:
 
     Composes, in order:
         1. Character encoding       – str → binary via *char_encoding*
-        2. Length header            – vote-protected 13-bit header with message
+        2. Error correction coding  – Reed-Solomon applied on the body only
+        3. Length header            – vote-protected 13-bit header with message
                                       length in bits (uses VoteCorrectionCode
                                       with *header_burst_error_tolerance*)
-        3. XOR bit mask             – obfuscation layer (always active)
-        4. Error correction coding  – Reed-Solomon redundancy (body + header)
+        4. XOR bit mask             – obfuscation layer (always active)
+
+    On decode, the order is reversed: XOR undo → strip header → RS decode(body).
 
     Usage::
 
@@ -182,7 +198,7 @@ class SteganoPipeline:
         """
         Full forward transformation: plain text → protected bit string.
 
-        Order: str→bits → length-header(Vote) → XOR → ECC encode.
+        New order: str→bits → RS encode(body) → vote-header → XOR.
         """
         if not message:
             return ""
@@ -193,7 +209,7 @@ class SteganoPipeline:
         """
         Full reverse transformation: protected bit string → plain text.
 
-        Order: ECC decode → XOR → strip header(Vote) → bits→str.
+        New order: XOR undo → strip header → RS decode(body) → bits→str.
         """
         if not bits:
             return ""
@@ -212,12 +228,13 @@ class SteganoPipeline:
         Returns:
             Tuple of (protected_bits, trace_dict).
             The trace dict has keys:
-              - ``"raw_bits"``         – output of str→bits conversion
-              - ``"header_bits"``      – raw 13-bit length header
-              - ``"header_protected"`` – vote-protected header
-              - ``"full_bits"``        – header + message bits (before XOR)
-              - ``"xor_bits"``         – after XOR masking
-              - ``"protected_bits"``   – after ECC encode (final output)
+              - ``"raw_bits"``           – output of str→bits conversion
+              - ``"body_ecc_bits"``      – after RS encode on the body only
+              - ``"header_bits"``        – raw 13-bit length header
+              - ``"header_protected"``   – vote-protected header
+              - ``"full_bits"``          – header + body_RS bits (before XOR)
+              - ``"xor_bits"``           – after XOR masking
+              - ``"protected_bits"``     – final output (same as xor_bits, no outer ECC)
         """
         if not message:
             return "", {}
@@ -234,11 +251,13 @@ class SteganoPipeline:
         Returns:
             Tuple of (recovered_message, trace_dict).
             The trace dict has keys:
-              - ``"ecc_output_bits"``    – after ECC decode
               - ``"xor_output_bits"``    – after XOR undo
-              - ``"full_bits"``          – header + message bits (after XOR)
+              - ``"xor_sample"``         – sample of first 40 bits after XOR
               - ``"header_protected"``   – vote-protected header extracted
               - ``"header_raw"``         – raw 13-bit header after vote decode
+              - ``"body_ecc_bits"``      – body bits extracted (RS-encoded body)
+              - ``"body_ecc_len"``       – length of body_ecc_bits
+              - ``"ecc_output_bits"``    – after RS decode on the body
               - ``"recovered_bits"``     – bits fed to bits→str conversion
               - ``"recovered_text"``     – final decoded string
         """
@@ -273,7 +292,14 @@ class SteganoPipeline:
         )
         trace.append(("raw_bits", bits))
 
-        # Step 2: Build vote-protected length header
+        # Step 2: ECC encode ONLY on the body bits (no header yet)
+        bits_ecc_body = self.ecc.encode(bits)
+        logger.info(
+            f"[Pipeline] ECC encode on body: {len(bits)}b → {len(bits_ecc_body)}b"
+        )
+        trace.append(("body_ecc_bits", bits_ecc_body))
+
+        # Step 3: Build vote-protected length header (length = raw body bits, NOT ecc body)
         header_raw = format(len(bits), f"0{HEADER_LENGTH_BITS}b")
         trace.append(("header_bits", header_raw))
 
@@ -287,19 +313,14 @@ class SteganoPipeline:
         )
         trace.append(("header_protected", header_protected))
 
-        # Step 3: Concatenate header + message bits
-        full_bits = header_protected + bits
+        # Step 4: Concatenate header + RS-encoded body bits
+        full_bits = header_protected + bits_ecc_body
         trace.append(("full_bits", full_bits))
 
-        # Step 4: XOR (always active)
+        # Step 5: XOR (always active) — THIS is the final output
         bits = self.xor_mask.apply(full_bits)
-        logger.info(f"[Pipeline] XOR applied ({len(bits)} bits)")
-        trace.append(("xor_bits", bits))
-
-        # Step 5: ECC encode
-        bits = self.ecc.encode(bits)
         logger.info(
-            f"[Pipeline] ECC encode → {len(bits)} protected bits"
+            f"[Pipeline] XOR applied ({len(bits)} bits) — final output"
         )
         trace.append(("protected_bits", bits))
 
@@ -314,19 +335,15 @@ class SteganoPipeline:
         """
         trace = []
 
-        # Step 1: ECC decode
-        corrected = self.ecc.decode(bits)
+        # Step 1: XOR undo (first, before anything else)
+        corrected = self.xor_mask.apply(bits)
         logger.info(
-            f"[Pipeline] ECC decode → {len(corrected)} bits"
+            f"[Pipeline] XOR reversed ({len(corrected)} bits)"
         )
-        trace.append(("ecc_output_bits", corrected))
-
-        # Step 2: XOR undo (always active)
-        corrected = self.xor_mask.apply(corrected)
-        logger.info(f"[Pipeline] XOR reversed ({len(corrected)} bits)")
         trace.append(("xor_output_bits", corrected))
+        trace.append(("xor_sample", corrected[:40]))
 
-        # Step 3: Extract and decode the vote-protected header
+        # Step 2: Extract and decode the vote-protected header
         header_len = HEADER_LENGTH_BITS * (
             2 * self.header_burst_error_tolerance + 1
         )
@@ -345,16 +362,40 @@ class SteganoPipeline:
             header_protected, self.header_burst_error_tolerance
         )
         trace.append(("header_raw", format(header_raw_decoded, f"0{HEADER_LENGTH_BITS}b")))
+        logger.info(
+            f"[Pipeline] header decoded: {header_raw_decoded} bits"
+        )
 
         message_bit_length = header_raw_decoded
 
-        # Step 4: Extract message bits
+        # If header is invalid (0), abort early
+        if message_bit_length == 0:
+            logger.warning("[Pipeline] header decoded to 0 — aborting decode")
+            return trace, ""
+
+        # Step 3: Extract body (RS-encoded) from after the header
         body_start = header_len
-        body_end = body_start + message_bit_length
-        recovered_bits = corrected[body_start:body_end]
+        # The body includes both the original message payload AND RS parity bytes
+        body_ecc_bits = corrected[body_start:]
+        trace.append(("body_ecc_bits", body_ecc_bits))
+        trace.append(("body_ecc_len", len(body_ecc_bits)))
+        logger.info(
+            f"[Pipeline] extracted body ECC: {len(body_ecc_bits)} bits "
+            f"(expected message length={message_bit_length}b)"
+        )
+
+        # Step 4: RS decode on the body
+        body_decoded = self.ecc.decode(body_ecc_bits)
+        logger.info(
+            f"[Pipeline] ECC decode on body: {len(body_ecc_bits)}b → {len(body_decoded)}b"
+        )
+        trace.append(("ecc_output_bits", body_decoded))
+
+        # Step 5: Take only the expected message bits from decoded body
+        recovered_bits = body_decoded[:message_bit_length]
         trace.append(("recovered_bits", recovered_bits))
 
-        # Step 5: bits → string
+        # Step 6: bits → string
         message = bits2string(recovered_bits, code=self.char_encoding)
         logger.info(
             f"[Pipeline] decode → {len(message)} chars "

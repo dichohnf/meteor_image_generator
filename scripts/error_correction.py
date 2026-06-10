@@ -41,6 +41,11 @@ class ErrorCorrectionCode(ABC):
         ...
 
     @property
+    def nsym(self) -> int:
+        """Number of ECC symbols (0 for non-block codes)."""
+        return 0
+
+    @property
     @abstractmethod
     def overhead_ratio(self) -> float:
         """Overhead factor introduced by the code (1.0 = no overhead)."""
@@ -204,11 +209,15 @@ class ReedSolomonCorrectionCode(ErrorCorrectionCode):
         # Forward any compatible kwargs to RSCodec constructor
         c_primitive = kwargs.pop("c_primitive", None)
 
-        self.nsym = nsym
+        self._nsym = nsym
         self._codec = (
             RSCodec(nsym) if c_primitive is None
             else RSCodec(nsym, c_primitive=c_primitive)
         )
+
+    @property
+    def nsym(self) -> int:
+        return self._nsym
 
     # ---- public interface -----------------------------------------------
 
@@ -258,7 +267,7 @@ class ReedSolomonCorrectionCode(ErrorCorrectionCode):
         rx_bytes = self._bits_to_bytes(body_bits)
 
         # RS decode (reedsolo.RSCodec.decode returns (decoded, ecc, errata_pos))
-        errata: list = []
+        errata: list = []  # type: ignore[no-redef]
         try:
             decoded_ba, ecc_ba, errata = self._codec.decode(bytearray(rx_bytes))
             success = True

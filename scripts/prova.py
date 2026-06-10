@@ -194,7 +194,8 @@ def main():
             image_path = os.path.join(root, filename)
             image = load_image(image_path)
 
-            # Decoder returns raw bits — run them through the pipeline to recover the string
+            # Decoder returns (raw_bits, raw_bits, decoded_indices, stats)
+            # raw_bits have XOR still applied — pipeline will undo it
             raw_bits, _, decoded_indices, decoding_stats = decoder.decode_message(options, image)
             recovered_text, decode_trace = pipeline.decode_message_with_trace(raw_bits)
 

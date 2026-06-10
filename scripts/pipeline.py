@@ -127,8 +127,8 @@ class SteganoPipeline:
         pipe = SteganoPipeline(
             xor_key=123,
             char_encoding="ASCII",
-            rs_nsym=10,
-            header_burst_error_tolerance=10,
+            rs_nsym=30,
+            header_burst_error_tolerance=7,
         )
         protected_bits = pipe.encode_message("Hello")
         recovered_msg = pipe.decode_message(protected_bits)
@@ -140,7 +140,7 @@ class SteganoPipeline:
         xor_key: int,
         char_encoding: str = "ASCII",
         error_correction_method: str = "reed_solomon",
-        header_burst_error_tolerance: int = 10,
+        header_burst_error_tolerance: int = 7,
         **ecc_kwargs,
     ) -> None:
         """
@@ -153,7 +153,7 @@ class SteganoPipeline:
                                      Default ``"reed_solomon"``.
             header_burst_error_tolerance: Burst error tolerance for the
                                           vote-protected length header.
-                                          Default 10 (→ 21 repetitions).
+                                          Default 7 (→ 15 repetitions).
             **ecc_kwargs: Keyword arguments forwarded to the ECC constructor
                           (e.g. ``nsym=10`` for Reed-Solomon).
         """
@@ -437,7 +437,7 @@ def build_pipeline_from_options(options) -> SteganoPipeline:
         }
     elif method == "reed_solomon":
         ecc_kwargs = {
-            "nsym": getattr(options, "rs_nsym", 10),
+            "nsym": getattr(options, "rs_nsym", 30),
         }
     else:
         ecc_kwargs = {}
@@ -446,6 +446,6 @@ def build_pipeline_from_options(options) -> SteganoPipeline:
         xor_key=getattr(options, "xor_key", 123),
         char_encoding=getattr(options, "char_encoding", "ASCII"),
         error_correction_method=method,
-        header_burst_error_tolerance=getattr(options, "header_burst_error_tolerance", 10),
+        header_burst_error_tolerance=getattr(options, "header_burst_error_tolerance", 7),
         **ecc_kwargs,
     )

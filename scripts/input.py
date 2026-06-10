@@ -48,10 +48,11 @@ def initialized_parser() -> ArgumentParser:
     parser.add_argument('--without-random-generation',
                         dest='random_generation', action='store_false')
     parser.add_argument('--burst-error-tolerance',
-                        type=int, required=False, default=10,
-                        help='Maximum number of consecutive bit errors the error correction can withstand. '
-                             'Default 10. The overhead is burst_error_tolerance * 2 + 1 times the original message size. '
-                             'Higher values protect against longer burst errors but add more redundancy.')
+                        type=int, required=False, default=7,
+                        help='Maximum number of consecutive bit errors the error correction (vote) can withstand. '
+                             'Default 7. The overhead is burst_error_tolerance * 2 + 1 times the original message size. '
+                             'Higher values protect against longer burst errors but add more redundancy. '
+                             'Used for the vote-protected length header.')
     parser.add_argument('--max-error-ratio',
                         type=float, required=False, default=0.2,
                         help='(DEPRECATED) Use --burst-error-tolerance instead. '
@@ -59,18 +60,20 @@ def initialized_parser() -> ArgumentParser:
                              'Default 0.2 means up to 20%% of bits can be corrected. '
                              'Higher values add more redundancy but allow more error recovery.')
     parser.add_argument('--error-correction-method',
-                        type=str, required=False, default='vote',
+                        type=str, required=False, default='reed_solomon',
                         choices=['vote', 'reed_solomon'],
-                        help='Error correction algorithm to use. "vote" uses full-message '
-                             'repetition with majority voting (burst-resistant). '
-                             '"reed_solomon" uses Reed-Solomon block coding over GF(256). '
-                             'Default: "vote".')
+                        help='Error correction algorithm to use for the message body. '
+                             '"reed_solomon" uses Reed-Solomon block coding over GF(256) '
+                             'and can correct up to rs_nsym // 2 byte errors. '
+                             '"vote" uses full-message repetition with majority voting '
+                             '(burst-resistant). The length header is always vote-protected. '
+                             'Default: "reed_solomon".')
     parser.add_argument('--rs-nsym',
-                        type=int, required=False, default=10,
+                        type=int, required=False, default=30,
                         help='Number of ECC symbols for Reed-Solomon code. '
                              'Can correct up to nsym // 2 erroneous bytes. '
                              'Only used when --error-correction-method=reed_solomon. '
-                             'Default: 10.')
+                             'Default: 30 (corrects ~15 byte errors = ~30% of 50 bytes).')
     parser.add_argument('--xor-key',
                         type=int, required=False, default=None,
                         help='Optional integer key (0-255) for XOR obfuscation of the '
@@ -102,9 +105,9 @@ class Options:
         relative_options_file_path : Optional[str] = None,
         random_generation : bool = False,
         max_error_ratio : float = 0.2,
-        burst_error_tolerance : int = 10,
-        error_correction_method : str = "vote",
-        rs_nsym : int = 10,
+        burst_error_tolerance : int = 7,
+        error_correction_method : str = "reed_solomon",
+        rs_nsym : int = 30,
     ) -> None:
         """
         Initializes the Options object with user-specified or default parameters.
@@ -121,8 +124,11 @@ class Options:
             random_generation: If True, generates random images without messages.
             max_error_ratio: (DEPRECATED) Maximum tolerable bit error ratio for error correction (0.0 to 1.0).
                              Default 0.2 means up to 20% of bits can be corrected.
-            burst_error_tolerance: Maximum number of consecutive bit errors the error correction
-                                   can withstand. Default 10.
+            burst_error_tolerance: Maximum number of consecutive bit errors the vote correction
+                                   (for the length header) can withstand. Default 7.
+            error_correction_method: Error correction algorithm for the message body.
+                                     Default "reed_solomon".
+            rs_nsym: Number of ECC symbols for Reed-Solomon. Default 30.
 
         Raises:
             ArgumentError: If required parameters are invalid.

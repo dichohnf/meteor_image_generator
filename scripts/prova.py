@@ -42,7 +42,7 @@ def _pipeline_to_dict(pipeline) -> dict:
         "char_encoding": pipeline.char_encoding,
         "ecc_method": type(pipeline.ecc).__name__,
         "xor_key": pipeline.xor_mask.key,
-        "header_burst_error_tolerance": pipeline.header_burst_error_tolerance,
+        "header_protection": "embedded_in_rs",
     }
 
     # Include ECC-specific parameters
@@ -120,8 +120,7 @@ def main():
     logger.info(
         f"Protected bits prepared: {len(protected_bits)} bits "
         f"(from {len(options.message)} chars). "
-        f"Vote-protected {HEADER_LENGTH_BITS}-bit header with "
-        f"tolerance={getattr(options, 'header_burst_error_tolerance', 10)}"
+        f"{HEADER_LENGTH_BITS}-bit header embedded in RS body"
     )
 
     # ============================================================

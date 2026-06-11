@@ -9,7 +9,7 @@ subsequent patches.
 
 import math
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Set, FrozenSet
 
 import numpy as np
 import torch
@@ -24,7 +24,7 @@ from scripts.utils import (
 )
 from scripts.logger import logger
 from scripts.stats import DecodingStatistics
-from scripts.error_correction import ErrorCorrectionFactory, ErrorCorrectionCode, VoteCorrectionCode
+from scripts.error_correction import ErrorCorrectionFactory, ErrorCorrectionCode
 from scripts.pipeline import HEADER_LENGTH_BITS, XorMask
 
 
@@ -282,13 +282,11 @@ class SteganographyDecoder:
             cond_translations.shape[0], cond_translations.shape[2], cond_translations.shape[3]
         ).squeeze()
 
-        half_start = math.floor(image_indices.shape[1] * self.context_fraction)
         building_tensor = image_indices.clone()
-        building_tensor[:, half_start:] = 0
         building_tensor = building_tensor.reshape(grid_shape)
-
-        current_row = half_start // grid_shape[1]
-        current_col = half_start % grid_shape[1]
+        # Start from (0, 0) — decode the entire grid
+        current_row = 0
+        current_col = 0
 
         height_crop = grid_shape[0] * PATCH_SIZE
         width_crop = grid_shape[1] * PATCH_SIZE
@@ -306,17 +304,17 @@ class SteganographyDecoder:
             nsym=getattr(options, "rs_nsym", 30),
         )
 
-        # Header config
-        header_tolerance = getattr(options, "burst_error_tolerance", 7)
-        header_len_bits = HEADER_LENGTH_BITS * (2 * header_tolerance + 1)
-
         # ------------------------------------------------------------------
         #  Buffers
         # ------------------------------------------------------------------
-        all_bits_aligned: List[str] = []       # bits after XOR undo = header + RS body
+        all_bits_aligned: List[str] = []       # bits after XOR undo = RS-encoded body (header inside)
         patch_records: List[PatchRecord] = []
         header_decoded = False
-        # message_bit_length = 0  # unused for now (header not used for early termination)
+        message_bit_length: int = 0
+        target_body_len: int = 0               # bits of body (before RS) needed to reach decoded_len
+        corrections_locked = False             # Task 4: anti-loop fingerprint
+        seen_patch_fingerprints: Set[FrozenSet[int]] = set()
+        BIT_MARGIN = 16                        # slack for target_body_len calculation
 
         total_remaining = (grid_shape[0] - current_row) * grid_shape[1] - current_col
         with tqdm(total=total_remaining, desc="Decoding message", disable=True) as pbar:
@@ -368,83 +366,83 @@ class SteganographyDecoder:
                 patch_index += 1
 
                 # ----------------------------------------------------------
-                #  Phase 1 — Decode vote-protected header (once)
+                #  Phase 1 — Extract header from RS-decoded body (once)
                 # ----------------------------------------------------------
                 if not header_decoded:
-                    aligned_so_far = "".join(all_bits_aligned)
-                    if len(aligned_so_far) >= header_len_bits:
-                        header_plain = aligned_so_far[:header_len_bits]
-                        vote = VoteCorrectionCode(burst_error_tolerance=header_tolerance)
-                        header_raw = vote.decode(header_plain)
-                        decoded_len = int(header_raw[:HEADER_LENGTH_BITS], 2)
-                        max_bits = (1 << HEADER_LENGTH_BITS) - 1
-                        if 0 < decoded_len <= max_bits:
-                            # message_bit_length = decoded_len
-                            header_decoded = True
-                            logger.info(
-                                f"[Decoder] Header decoded: message length = {decoded_len} bits"
-                            )
-                        else:
-                            logger.warning(
-                                f"[Decoder] Invalid header length {decoded_len}"
-                            )
-                    continue  # skip RS until header is ready
+                    body_bits = "".join(all_bits_aligned)
+                    # Need at least nsym+1 bytes + 3 bits RS header to attempt decode
+                    if len(body_bits) >= 8 * (ecc.nsym + 1) + 3:
+                        try:
+                            decoded_body = ecc.decode(body_bits)
+                            decoded_len = int(decoded_body[:HEADER_LENGTH_BITS], 2)
+                            max_bits = (1 << HEADER_LENGTH_BITS) - 1
+                            if 0 < decoded_len <= max_bits:
+                                message_bit_length = decoded_len
+                                header_decoded = True
+                                # Calculate how many body bits (before RS) are needed
+                                rs_payload_bits = ((decoded_len + HEADER_LENGTH_BITS + 7) // 8) * 8 + 3
+                                target_body_len = len(ecc.encode("0" * rs_payload_bits))
+                                logger.info(
+                                    f"[Decoder] Header decoded from RS body: "
+                                    f"message length = {decoded_len} bits, "
+                                    f"target body = {target_body_len} bits"
+                                )
+                            else:
+                                logger.warning(
+                                    f"[Decoder] Invalid header length {decoded_len}"
+                                )
+                        except Exception:
+                            pass  # keep accumulating bits
+                    continue
 
                 # ----------------------------------------------------------
-                #  Phase 2 — RS correction interleaved
+                #  Phase 2 — Early termination if we have enough bits
+                # ----------------------------------------------------------
+                if header_decoded and target_body_len > 0:
+                    bits_so_far = len("".join(all_bits_aligned))
+                    if bits_so_far >= target_body_len - BIT_MARGIN:
+                        logger.info(
+                            f"[Decoder] Reached target body length "
+                            f"({bits_so_far} >= {target_body_len} - {BIT_MARGIN}) — stopping"
+                        )
+                        break
+
+                # ----------------------------------------------------------
+                #  Phase 3 — RS correction interleaved
                 #
-                #  Try to ECC-decode the accumulated body bits (after header).
+                #  Try to ECC-decode the accumulated body bits.
                 #  If it succeeds and errors were found, re-select patches.
                 # ----------------------------------------------------------
-                body_bits = "".join(all_bits_aligned)[header_len_bits:]
+                body_bits = "".join(all_bits_aligned)
 
-                # Minimum: RS header (3 bits) + at least 1 byte payload (8) = 11 bits
-                # But we need at least nsym bytes of parity too to decode.
-                # We try regardless — if it fails, we accumulate more.
-                if len(body_bits) >= 8 * (ecc.nsym + 1) + 3:
+                if len(body_bits) >= 8 * (ecc.nsym + 1) + 3 and not corrections_locked:
                     try:
                         decoded_body = ecc.decode(body_bits)
-                        # If we get here, RS succeeded (with or without corrections)
                         logger.info(
                             f"[Decoder] RS decode successful "
                             f"({len(body_bits)} body bits → {len(decoded_body)} msg bits)"
                         )
-                        # Body bits WITHOUT RS header (first 3 bits are padding len)
-                        # We need to figure out what the *corrected* body bits are
-                        # before RS padding removal, to compare with original.
-                        # 
-                        # To do this, we use the RS codec's _bits_to_bytes and _bytes_to_bits
-                        # (accessible via ecc) to reconstruct the corrected raw stream.
-                        # 
-                        # Actually, we need a lower-level interface. Let's compute it:
-                        # decoded body represents what the *message* is.
-                        # We need to compare "body_bits" (pre-RS) with the corrected version.
-                        # The corrected version = RS-encode(decoded_body) = body_bits_corrected.
-                        # We can do this by re-encoding the decoded body with the same RS params.
                         corrected_body = ecc.encode(decoded_body)
-                        # corrected_body now has the RS header + parity. But body_bits 
-                        # also has RS header + parity. Compare directly.
-                        # 
-                        # Align lengths:
                         min_len = min(len(body_bits), len(corrected_body))
                         orig_slice = body_bits[:min_len]
                         corr_slice = corrected_body[:min_len]
 
                         if orig_slice != corr_slice:
+                            n_errors = sum(1 for a, b in zip(orig_slice, corr_slice) if a != b)
                             logger.info(
-                                f"[Decoder] RS corrected {sum(1 for a, b in zip(orig_slice, corr_slice) if a != b)} bit errors"
+                                f"[Decoder] RS corrected {n_errors} bit errors"
                             )
                             self._fix_patches_from_correction(
                                 reference_tensor, building_tensor,
-                                patch_records, header_len_bits,
+                                patch_records, 0,  # header_len_bits = 0 (no vote header)
                                 orig_slice, corr_slice,
                                 selected_indices_list,
+                                seen_patch_fingerprints,
                             )
                         else:
                             logger.info("[Decoder] RS verified — no corrections needed")
 
                     except Exception as ex:
-                        # RS decode failed — keep accumulating
                         logger.info(
                             f"[Decoder] RS decode failed ({type(ex).__name__}) — "
                             f"need more bits (have {len(body_bits)})"
@@ -466,6 +464,7 @@ class SteganographyDecoder:
         original_bits: str,
         corrected_bits: str,
         selected_indices_list: List[int],
+        seen_patch_fingerprints: Optional[Set[FrozenSet[int]]] = None,
     ) -> None:
         """
         Compare original (pre-RS) body bits with corrected body bits.
@@ -508,6 +507,18 @@ class SteganographyDecoder:
 
         if not patches_to_fix:
             return
+
+        # Task 4: Anti-loop fingerprint — if we've already corrected these
+        # same patches before without any change, lock further corrections.
+        if seen_patch_fingerprints is not None:
+            patch_fingerprint = frozenset(sorted(patches_to_fix))
+            if patch_fingerprint in seen_patch_fingerprints:
+                logger.warning(
+                    f"[Decoder] Same patches {sorted(patches_to_fix)} "
+                    f"keep getting corrected — locking further corrections"
+                )
+                return
+            seen_patch_fingerprints.add(patch_fingerprint)
 
         logger.info(
             f"[Decoder] Re-selecting {len(patches_to_fix)} patches "

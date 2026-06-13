@@ -1,10 +1,9 @@
 """
 Error correction module for the steganography system.
 
-Provides multiple error correction algorithms:
-1. VoteCorrectionCode — full-message repetition with majority voting (burst-resistant)
-2. ReedSolomonCorrectionCode — Reed-Solomon block code over GF(256) via ``reedsolo``
-3. ErrorCorrectionFactory — static factory to build the appropriate codec by name.
+Provides Reed-Solomon error correction over GF(256) via the ``reedsolo``
+library.  The voting / repetition code (VoteCorrectionCode) has been
+removed — RS is the only supported algorithm.
 
 All codecs implement the abstract ErrorCorrectionCode interface with
     encode(bits: str) -> str
@@ -12,7 +11,7 @@ All codecs implement the abstract ErrorCorrectionCode interface with
 """
 
 from abc import ABC, abstractmethod
-from typing import ClassVar, List
+from typing import ClassVar
 from scripts.logger import logger
 
 
@@ -53,124 +52,7 @@ class ErrorCorrectionCode(ABC):
 
 
 # ======================================================================
-#  1 — VoteCorrectionCode (full-message repetition + majority voting)
-# ======================================================================
-
-class VoteCorrectionCode(ErrorCorrectionCode):
-    """
-    Full-message repetition code with majority voting.
-
-    The entire message bit string is repeated N times (odd number).
-    During decoding, the repetitions are aligned and bit-by-bit majority
-    voting recovers each original bit.
-
-    This code is optimised for **burst errors** caused by VQGAN patch
-    re-encoding.  A single patch corruption flips at most
-    ``DEFAULT_PRECISION_BITS`` (16) consecutive bits within **one copy**
-    of the message.  With ``repetitions = 2 * burst_error_tolerance + 1``,
-    the algorithm can survive up to ``burst_error_tolerance`` such
-    corrupted patches without losing data.
-
-    The algorithm is:
-
-        repetitions = 2 * burst_error_tolerance + 1
-        encoded_bits = message_bits * repetitions
-        decode:
-            for each bit position i:
-                vote = majority(copy_0[i], copy_1[i], ..., copy_N[i])
-                recovered[i] = vote
-
-    Attributes:
-        burst_error_tolerance: Maximum number of patches that can be
-            corrupted without losing data (default 10).
-        repetitions: Number of copies of the message (always odd).
-    """
-
-    name: ClassVar[str] = "vote"
-
-    def __init__(self, burst_error_tolerance: int = 10) -> None:
-        if burst_error_tolerance < 1:
-            raise ValueError(
-                f"burst_error_tolerance must be >= 1, got {burst_error_tolerance}"
-            )
-        self.burst_error_tolerance = burst_error_tolerance
-        self.repetitions = burst_error_tolerance * 2 + 1
-        self._correctable_per_position = self.repetitions // 2
-
-    def encode(self, bits: str) -> str:
-        if not bits:
-            return ""
-        encoded = bits * self.repetitions
-        logger.info(
-            f"[Vote] encode: {len(bits)} bits -> {len(encoded)} bits "
-            f"(repetitions={self.repetitions})"
-        )
-        return encoded
-
-    def decode(self, encoded_bits: str) -> str:
-        if not encoded_bits:
-            return ""
-
-        message_len = len(encoded_bits) // self.repetitions
-        if message_len == 0:
-            return ""
-
-        decoded_parts: List[str] = []
-        total_errors = 0
-        error_positions = 0
-
-        for pos in range(message_len):
-            bits_at_pos = [
-                encoded_bits[rep * message_len + pos]
-                for rep in range(self.repetitions)
-                if rep * message_len + pos < len(encoded_bits)
-            ]
-            ones = bits_at_pos.count("1")
-            zeros = len(bits_at_pos) - ones
-
-            if ones > zeros:
-                recovered = "1"
-                err = zeros
-            elif zeros > ones:
-                recovered = "0"
-                err = ones
-            else:
-                recovered = bits_at_pos[0]
-                err = len(bits_at_pos) // 2
-
-            decoded_parts.append(recovered)
-            total_errors += err
-            if err > 0:
-                error_positions += 1
-
-        decoded = "".join(decoded_parts)
-
-        total_bits = message_len * self.repetitions
-        err_ratio = total_errors / total_bits if total_bits else 0.0
-
-        if error_positions > 0:
-            logger.info(
-                f"[Vote] decode: corrected {total_errors} errors across "
-                f"{error_positions} positions (err_ratio={err_ratio:.4f})"
-            )
-        else:
-            logger.info("[Vote] decode: no errors detected.")
-
-        return decoded
-
-    @property
-    def overhead_ratio(self) -> float:
-        return float(self.repetitions)
-
-    def __repr__(self) -> str:
-        return (
-            f"VoteCorrectionCode(burst_error_tolerance={self.burst_error_tolerance}, "
-            f"repetitions={self.repetitions})"
-        )
-
-
-# ======================================================================
-#  2 — Reed-Solomon code via the ``reedsolo`` library
+#  Reed-Solomon code via the ``reedsolo`` library
 #
 #  This wrapper uses the public reedsolo.RSCodec interface.
 #  Install with:  pip install reedsolo
@@ -193,7 +75,7 @@ class ReedSolomonCorrectionCode(ErrorCorrectionCode):
 
     name: ClassVar[str] = "reed_solomon"
 
-    def __init__(self, nsym: int = 10, **kwargs) -> None:
+    def __init__(self, nsym: int = 5) -> None:
         if nsym < 1:
             raise ValueError(f"nsym must be >= 1, got {nsym}")
 
@@ -206,14 +88,8 @@ class ReedSolomonCorrectionCode(ErrorCorrectionCode):
                 "Install with:  pip install reedsolo"
             ) from None
 
-        # Forward any compatible kwargs to RSCodec constructor
-        c_primitive = kwargs.pop("c_primitive", None)
-
         self._nsym = nsym
-        self._codec = (
-            RSCodec(nsym) if c_primitive is None
-            else RSCodec(nsym, c_primitive=c_primitive)
-        )
+        self._codec = RSCodec(nsym)
 
     @property
     def nsym(self) -> int:
@@ -327,57 +203,3 @@ class ReedSolomonCorrectionCode(ErrorCorrectionCode):
 
     def __repr__(self) -> str:
         return f"ReedSolomonCorrectionCode(nsym={self.nsym})"
-
-
-# ======================================================================
-#  3 — ErrorCorrectionFactory
-# ======================================================================
-
-class ErrorCorrectionFactory:
-    """
-    Static factory for building ErrorCorrectionCode instances by name.
-
-    Usage::
-
-        ecc = ErrorCorrectionFactory.create("vote", burst_error_tolerance=10)
-        ecc = ErrorCorrectionFactory.create("reed_solomon", nsym=10)
-    """
-
-    _REGISTRY: ClassVar[dict] = {
-        "vote": VoteCorrectionCode,
-        "reed_solomon": ReedSolomonCorrectionCode,
-    }
-
-    @staticmethod
-    def register(name: str, codec_class: type) -> None:
-        """Register a custom codec class under *name*."""
-        ErrorCorrectionFactory._REGISTRY[name] = codec_class
-
-    @staticmethod
-    def create(method: str, **kwargs) -> ErrorCorrectionCode:
-        """
-        Build and return an ErrorCorrectionCode instance.
-
-        Args:
-            method: Algorithm name.  Built-in choices are ``"vote"`` and
-                    ``"reed_solomon"``.  Custom names can be added via
-                    :meth:`register`.
-            **kwargs: Keyword arguments forwarded to the concrete class
-                      constructor.
-
-        Returns:
-            An :class:`ErrorCorrectionCode` instance.
-
-        Raises:
-            ValueError: If *method* is not recognised.
-        """
-        cls = ErrorCorrectionFactory._REGISTRY.get(method)
-        if cls is None:
-            raise ValueError(
-                f"Unknown error correction method {method!r}. "
-                f"Available: {list(ErrorCorrectionFactory._REGISTRY)}"
-            )
-        logger.info(
-            f"Factory: building {cls.__name__} with kwargs {kwargs}"
-        )
-        return cls(**kwargs)

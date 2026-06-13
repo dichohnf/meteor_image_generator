@@ -4,23 +4,39 @@ Steganographic pipeline for message transformation.
 Chains together all string-level transformations independently from the
 VQGAN image encoding/decoding::
 
-    encode:  message (str) → CharToBits → ECC(RS) on body → LengthHeader(Vote)
-             → header_vote + body_RS → XOR → bits (str)
-    decode:  bits (str)    → XOR undo → StripHeader(Vote) → body_RS → ECC(RS) on body
-             → BitsToChar → message (str)
+    encode:  message (str) → CharToBits → split (header+body) into 10-byte
+             blocks → RS-encode each block → strip RS padding header →
+             concatenate → XOR
+    decode:  bits (str)    → XOR undo → split into fixed 120-bit blocks →
+             restore 3-bit pad header → RS-decode each block → trim to
+             expected payload → extract length header → take body → BitsToChar
 
-The pipeline is self-contained: the encoder/decoder receive/return raw bits
+The pipeline is self-contained: the encoder/decoder return raw bits
 and never see the internals of the pipeline.
+
+RS:  Each 10-byte payload block is RS-encoded with nsym=5 → 15 bytes.
+     The 3-bit padding header that ReedSolomonCorrectionCode.encode adds
+     is stripped/restored internally by the pipeline so that each block
+     occupies exactly (10 + 5) * 8 = 120 bits in the transmitted stream.
 """
 
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
-from scripts.error_correction import ErrorCorrectionFactory, ErrorCorrectionCode
+from scripts.error_correction import ReedSolomonCorrectionCode
 from scripts.bit_utils import bits2string, string2bits
 from scripts.logger import logger
 
 # Number of bits used for the length header (supports up to 2^13 - 1 = 8191 bits)
 HEADER_LENGTH_BITS = 13
+
+# Block-wise Reed-Solomon parameters
+RS_BLOCK_BYTES = 10       # payload bytes per RS block
+RS_NSYM = 5               # ECC parity symbols per block
+RS_PAYLOAD_BITS = RS_BLOCK_BYTES * 8         # 80 bits
+
+# Encoded size of a full block (10 payload bytes + 5 ECC bytes) = 15 bytes = 120 bits
+# after stripping the 3-bit RS-internal padding header.
+RS_ENCODED_BITS = (RS_BLOCK_BYTES + RS_NSYM) * 8  # 120 bits
 
 
 # ======================================================================
@@ -46,6 +62,69 @@ def _decode_length_from_body(body_decoded: str) -> int:
         )
         return 0
     return num_bits
+
+
+# ======================================================================
+#  Block-wise RS helpers  (fixed-size blocks, 120 bits each)
+# ======================================================================
+
+def _split_into_rs_blocks(bits: str) -> List[str]:
+    """
+    Split a bit string into blocks of *RS_PAYLOAD_BITS* bits (80 bits = 10 bytes).
+    The last block may be smaller.
+    """
+    blocks = []
+    for i in range(0, len(bits), RS_PAYLOAD_BITS):
+        blocks.append(bits[i:i + RS_PAYLOAD_BITS])
+    return blocks
+
+
+def encode_block_fixed_size(block_bits: str, ecc: ReedSolomonCorrectionCode) -> str:
+    """
+    RS-encode a single block and return exactly RS_ENCODED_BITS (120 bits).
+
+    1. Pad block_bits to RS_PAYLOAD_BITS (80 bits).
+    2. RS-encode via ecc.encode() → 123 bits (3 pad header + 120 body).
+    3. Strip the 3-bit padding header → 120 bits.
+
+    This guarantees that every block (including the last) occupies exactly
+    RS_ENCODED_BITS in the transmitted stream, making the decoder's job
+    trivial: split by RS_ENCODED_BITS.
+    """
+    # Pad to 80 bits
+    padded = block_bits.ljust(RS_PAYLOAD_BITS, "0")
+    # RS-encode: returns 3-bit pad header + encoded body
+    raw_encoded = ecc.encode(padded)
+    # Strip the 3-bit padding header
+    return raw_encoded[3:]
+
+
+def decode_block_fixed_size(encoded_bits: str, ecc: ReedSolomonCorrectionCode,
+                            expected_payload_bits: int) -> str:
+    """
+    RS-decode a single fixed-size block (RS_ENCODED_BITS = 120 bits).
+
+    Restores the 3-bit padding header before calling ecc.decode(), then
+    trims the result to expected_payload_bits.
+
+    Args:
+        encoded_bits: Exactly RS_ENCODED_BITS (120) bits.
+        ecc: The RS codec instance.
+        expected_payload_bits: Expected payload size (80 for full blocks, less for last).
+
+    Returns:
+        The decoded payload bits (trimmed to expected_payload_bits).
+    """
+    if len(encoded_bits) != RS_ENCODED_BITS:
+        # Allow the decoder to handle edge cases
+        pass
+    # Restore the 3-bit padding header (pad_len=0 for full-payload blocks)
+    restored = "000" + encoded_bits
+    decoded = ecc.decode(restored)
+    # Trim to expected payload bits
+    if len(decoded) > expected_payload_bits:
+        decoded = decoded[:expected_payload_bits]
+    return decoded
 
 
 # ======================================================================
@@ -89,19 +168,19 @@ class SteganoPipeline:
     Full string-transformation pipeline for steganography.
 
     Composes, in order:
-        1. Character encoding       – str → binary via *char_encoding*
-        2. Length header            – 13-bit message length in bits (prepended to body)
-        3. Error correction coding  – Reed-Solomon applied over (header + body)
-        4. XOR bit mask             – obfuscation layer (always active)
+        1. Character encoding       - str → binary via *char_encoding*
+        2. Length header            - 13-bit message length in bits (prepended to body)
+        3. Block-wise error correction  - Reed-Solomon applied per 10-byte block
+        4. XOR bit mask             - obfuscation layer (always active)
 
-    On decode, the order is reversed: XOR undo → strip header → RS decode(body).
+    On decode, the order is reversed: XOR undo → split into blocks →
+    RS decode each block → extract header → take body → bits→str.
 
         Usage::
 
             pipe = SteganoPipeline(
                 xor_key=123,
                 char_encoding="ASCII",
-                rs_nsym=30,
             )
             protected_bits = pipe.encode_message("Hello")
             recovered_msg = pipe.decode_message(protected_bits)
@@ -112,8 +191,6 @@ class SteganoPipeline:
         *,
         xor_key: int,
         char_encoding: str = "ASCII",
-        error_correction_method: str = "reed_solomon",
-        **ecc_kwargs,
     ) -> None:
         """
         Args:
@@ -121,12 +198,6 @@ class SteganoPipeline:
             char_encoding: Character encoding for str↔bits conversion.
                            One of ``"ASCII"``, ``"UNICODE"``, ``"DECIMAL"``.
                            Default ``"ASCII"``.
-            error_correction_method: Error correction algorithm for the body.
-                                     Default ``"reed_solomon"``.
-            (The 13-bit length header is embedded inside the RS body;
-             no separate vote protection is needed.)
-            **ecc_kwargs: Keyword arguments forwarded to the ECC constructor
-                          (e.g. ``nsym=10`` for Reed-Solomon).
         """
         # 1. Character encoding
         supported = {"ASCII", "UNICODE", "DECIMAL"}
@@ -140,16 +211,16 @@ class SteganoPipeline:
         # 2. XOR mask (always active)
         self.xor_mask = XorMask(xor_key)
 
-        # 3. Body ECC
-        self.ecc: ErrorCorrectionCode = ErrorCorrectionFactory.create(
-            error_correction_method, **ecc_kwargs,
-        )
+        # 3. Block-wise RS ECC with fixed parameters
+        self.ecc = ReedSolomonCorrectionCode(nsym=RS_NSYM)
 
         logger.info(
             f"SteganoPipeline initialized: "
             f"xor_key={xor_key}, "
             f"encoding={self.char_encoding}, "
-            f"ecc={self.ecc}"
+            f"ecc={self.ecc}, "
+            f"block={RS_BLOCK_BYTES}B + {RS_NSYM}B RS, "
+            f"fixed_block_size={RS_ENCODED_BITS}b"
         )
 
     # ------------------------------------------------------------------
@@ -159,8 +230,6 @@ class SteganoPipeline:
     def encode_message(self, message: str) -> str:
         """
         Full forward transformation: plain text → protected bit string.
-
-        New order: str→bits → RS encode(body) → vote-header → XOR.
         """
         if not message:
             return ""
@@ -170,8 +239,6 @@ class SteganoPipeline:
     def decode_message(self, bits: str) -> str:
         """
         Full reverse transformation: protected bit string → plain text.
-
-        New order: XOR undo → strip header → RS decode(body) → bits→str.
         """
         if not bits:
             return ""
@@ -190,13 +257,11 @@ class SteganoPipeline:
         Returns:
             Tuple of (protected_bits, trace_dict).
             The trace dict has keys:
-              - ``"raw_bits"``           – output of str→bits conversion
-              - ``"body_ecc_bits"``      – after RS encode on the body only
-              - ``"header_bits"``        – raw 13-bit length header
-              - ``"header_protected"``   – vote-protected header
-              - ``"full_bits"``          – header + body_RS bits (before XOR)
-              - ``"xor_bits"``           – after XOR masking
-              - ``"protected_bits"``     – final output (same as xor_bits, no outer ECC)
+              - ``"raw_bits"``           - output of str→bits conversion
+              - ``"header_bits"``        - raw 13-bit length header
+              - ``"body_blocks"``        - list of (payload_bits, encoded_bits) per block
+              - ``"full_bits"``          - concatenated all RS-encoded blocks (before XOR)
+              - ``"protected_bits"``     - after XOR masking
         """
         if not message:
             return "", {}
@@ -213,15 +278,12 @@ class SteganoPipeline:
         Returns:
             Tuple of (recovered_message, trace_dict).
             The trace dict has keys:
-              - ``"xor_output_bits"``    – after XOR undo
-              - ``"xor_sample"``         – sample of first 40 bits after XOR
-              - ``"header_protected"``   – vote-protected header extracted
-              - ``"header_raw"``         – raw 13-bit header after vote decode
-              - ``"body_ecc_bits"``      – body bits extracted (RS-encoded body)
-              - ``"body_ecc_len"``       – length of body_ecc_bits
-              - ``"ecc_output_bits"``    – after RS decode on the body
-              - ``"recovered_bits"``     – bits fed to bits→str conversion
-              - ``"recovered_text"``     – final decoded string
+              - ``"xor_output_bits"``    - after XOR undo
+              - ``"blocks_info"``        - list of (encoded_size, decoded_size) per block
+              - ``"body_decoded"``       - concatenated decoded bits from all blocks
+              - ``"header_raw"``         - raw 13-bit header
+              - ``"recovered_bits"``     - message bits extracted from body
+              - ``"recovered_text"``     - final decoded string
         """
         if not bits:
             return "", {}
@@ -240,9 +302,8 @@ class SteganoPipeline:
         """
         Run encode_message step-by-step and record each intermediate.
 
-        Returns:
-            Tuple of (trace_list, final_bits).
-            trace_list is a list of ``(step_label, bit_string)`` tuples.
+        New order: str→bits → split into 10-byte RS blocks →
+                   RS-encode each (fixed 120-bit output) → concatenate → XOR.
         """
         trace = []
 
@@ -258,25 +319,40 @@ class SteganoPipeline:
         header_raw = format(len(bits), f"0{HEADER_LENGTH_BITS}b")
         trace.append(("header_bits", header_raw))
 
+        # Combine header + body bits
         body_input = header_raw + bits
         logger.info(
-            f"[Pipeline] payload for RS: {len(body_input)}b = "
+            f"[Pipeline] payload for block-wise RS: {len(body_input)}b = "
             f"{HEADER_LENGTH_BITS}b header + {len(bits)}b body"
         )
 
-        # Step 3: RS-encode (header+body) together
-        bits_ecc_body = self.ecc.encode(body_input)
+        # Step 3: Split into blocks and RS-encode each
+        payload_blocks = _split_into_rs_blocks(body_input)
+        encoded_blocks: List[str] = []
+        blocks_info = []
+
+        for idx, block in enumerate(payload_blocks):
+            encoded = encode_block_fixed_size(block, self.ecc)
+            encoded_blocks.append(encoded)
+            blocks_info.append((block, encoded))
+            logger.info(
+                f"[Pipeline] RS block {idx}: {len(block)}b payload → "
+                f"{len(encoded)}b encoded"
+            )
+
+        trace.append(("body_blocks", str(blocks_info)))  # diagnostic string
+        full_bits = "".join(encoded_blocks)
+        trace.append(("full_bits", full_bits))
         logger.info(
-            f"[Pipeline] RS encode on (header+body): "
-            f"{len(body_input)}b → {len(bits_ecc_body)}b"
+            f"[Pipeline] block-wise RS: {len(body_input)}b → {len(full_bits)}b "
+            f"({len(payload_blocks)} blocks, {RS_ENCODED_BITS}b/block)"
         )
-        trace.append(("body_ecc_bits", bits_ecc_body))
-        trace.append(("full_bits", bits_ecc_body))
 
         # Step 4: XOR (always active) — THIS is the final output
-        bits = self.xor_mask.apply(bits_ecc_body)
+        bits = self.xor_mask.apply(full_bits)
         logger.info(
-            f"[Pipeline] XOR applied ({len(bits)} bits) — final output"
+            f"[Pipeline] XOR applied ({len(bits)} bits, "
+            f"{len(full_bits)} before XOR) — final output"
         )
         trace.append(("protected_bits", bits))
 
@@ -286,8 +362,9 @@ class SteganoPipeline:
         """
         Run decode_message step-by-step and record each intermediate.
 
-        Returns:
-            Tuple of (trace_list, recovered_message).
+        New order: XOR undo → split into fixed 120-bit RS blocks →
+                   RS-decode each → concatenate decoded blocks →
+                   extract header → take body → bits→str.
         """
         trace = []
 
@@ -299,23 +376,53 @@ class SteganoPipeline:
         trace.append(("xor_output_bits", corrected))
         trace.append(("xor_sample", corrected[:40]))
 
-        # Step 2: The entire bit stream after XOR undo is the RS-encoded body
-        # (header is embedded inside the RS body)
-        body_ecc_bits = corrected
-        trace.append(("body_ecc_bits", body_ecc_bits))
-        trace.append(("body_ecc_len", len(body_ecc_bits)))
+        # Step 2: Split into fixed-size blocks and decode each.
+        # Each block is exactly RS_ENCODED_BITS (120 bits), except possibly
+        # the last block if the stream was truncated.
+        blocks_info = []
+        decoded_parts: List[str] = []
+        offset = 0
+
+        while offset < len(corrected):
+            chunk = corrected[offset:offset + RS_ENCODED_BITS]
+
+            if len(chunk) < 8:  # too short to be useful
+                logger.warning(
+                    f"[Pipeline] RS decode: trailing {len(chunk)} bits ignored"
+                )
+                break
+
+            if len(chunk) == RS_ENCODED_BITS:
+                # Full-size block: expect 80 payload bits
+                decoded_block = decode_block_fixed_size(chunk, self.ecc,
+                                                        RS_PAYLOAD_BITS)
+            else:
+                # Last block (truncated): use the RS decode which handles it
+                # by trying the actual size
+                decoded_block = self.ecc.decode("000" + chunk)
+                if decoded_block:
+                    decoded_block = decoded_block[:RS_PAYLOAD_BITS]
+
+            if decoded_block:
+                blocks_info.append((len(chunk), len(decoded_block)))
+                decoded_parts.append(decoded_block)
+                offset += len(chunk)
+            else:
+                logger.warning(
+                    f"[Pipeline] Cannot decode RS block at offset {offset}, "
+                    f"size {len(chunk)}"
+                )
+                break
+
+        body_decoded = "".join(decoded_parts)
+        trace.append(("body_decoded", body_decoded))
+        trace.append(("blocks_info", str(blocks_info)))
         logger.info(
-            f"[Pipeline] extracted body ECC: {len(body_ecc_bits)} bits"
+            f"[Pipeline] block-wise RS decode: {len(corrected)}b → "
+            f"{len(body_decoded)}b ({len(blocks_info)} blocks)"
         )
 
-        # Step 3: RS decode on the body
-        body_decoded = self.ecc.decode(body_ecc_bits)
-        logger.info(
-            f"[Pipeline] ECC decode on body: {len(body_ecc_bits)}b → {len(body_decoded)}b"
-        )
-        trace.append(("ecc_output_bits", body_decoded))
-
-        # Step 4: Extract header from first HEADER_LENGTH_BITS bits of decoded body
+        # Step 3: Extract header from first HEADER_LENGTH_BITS bits of decoded body
         message_bit_length = _decode_length_from_body(body_decoded)
         trace.append(("header_raw", format(message_bit_length, f"0{HEADER_LENGTH_BITS}b")))
         logger.info(
@@ -326,11 +433,11 @@ class SteganoPipeline:
             logger.warning("[Pipeline] header decoded to 0 — aborting decode")
             return trace, ""
 
-        # Step 5: Take only the expected message bits from decoded body
+        # Step 4: Take only the expected message bits from decoded body
         recovered_bits = body_decoded[HEADER_LENGTH_BITS:HEADER_LENGTH_BITS + message_bit_length]
         trace.append(("recovered_bits", recovered_bits))
 
-        # Step 6: bits → string
+        # Step 5: bits → string
         message = bits2string(recovered_bits, code=self.char_encoding)
         logger.info(
             f"[Pipeline] decode → {len(message)} chars "
@@ -350,8 +457,8 @@ class SteganoPipeline:
             f"SteganoPipeline("
             f"xor_key={self.xor_mask.key}, "
             f"encoding={self.char_encoding!r}, "
-            f"ecc={self.ecc}, "
-            f"header_tolerance=<embedded_in_rs>)"
+            f"ecc=RS(nsym={RS_NSYM},block={RS_BLOCK_BYTES}B), "
+            f"fixed_block={RS_ENCODED_BITS}b)"
         )
 
 
@@ -364,22 +471,9 @@ def build_pipeline_from_options(options) -> SteganoPipeline:
     Build a :class:`SteganoPipeline` from an ``Options`` namespace.
 
     This is the bridge between CLI arguments and the pipeline object.
+    Only uses xor_key and char_encoding from options (ECC is fixed).
     """
-    method = getattr(options, "error_correction_method", "reed_solomon")
-    if method == "vote":
-        ecc_kwargs = {
-            "burst_error_tolerance": getattr(options, "burst_error_tolerance", 10),
-        }
-    elif method == "reed_solomon":
-        ecc_kwargs = {
-            "nsym": getattr(options, "rs_nsym", 30),
-        }
-    else:
-        ecc_kwargs = {}
-
     return SteganoPipeline(
         xor_key=getattr(options, "xor_key", 123),
         char_encoding=getattr(options, "char_encoding", "ASCII"),
-        error_correction_method=method,
-        **ecc_kwargs,
     )

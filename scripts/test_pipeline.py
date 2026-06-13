@@ -10,53 +10,10 @@ Run with::
 from scripts.pipeline import SteganoPipeline, build_pipeline_from_options
 
 
-def test_vote_with_xor():
-    """Vote correction code + XOR mask roundtrip."""
-    pipe = SteganoPipeline(
-        xor_key=42,
-        char_encoding="ASCII",
-        error_correction_method="vote",
-        burst_error_tolerance=10,
-    )
+def test_with_xor():
+    """RS correction code + XOR mask roundtrip."""
+    pipe = SteganoPipeline(xor_key=42, char_encoding="ASCII")
     original = "Hello World!"
-    protected = pipe.encode_message(original)
-    recovered = pipe.decode_message(protected)
-    assert original == recovered, (
-        f"Vote+XOR roundtrip failed:\n"
-        f"  original:  {original!r}\n"
-        f"  recovered: {recovered!r}"
-    )
-    print("[PASS] test_vote_with_xor")
-
-
-def test_vote_no_xor():
-    """Vote correction code without XOR mask roundtrip."""
-    pipe = SteganoPipeline(
-        xor_key=None,
-        char_encoding="ASCII",
-        error_correction_method="vote",
-        burst_error_tolerance=5,
-    )
-    original = "Test123"
-    protected = pipe.encode_message(original)
-    recovered = pipe.decode_message(protected)
-    assert original == recovered, (
-        f"Vote no-XOR roundtrip failed:\n"
-        f"  original:  {original!r}\n"
-        f"  recovered: {recovered!r}"
-    )
-    print("[PASS] test_vote_no_xor")
-
-
-def test_reed_solomon_with_xor():
-    """Reed-Solomon correction code + XOR mask roundtrip."""
-    pipe = SteganoPipeline(
-        xor_key=99,
-        char_encoding="ASCII",
-        error_correction_method="reed_solomon",
-        nsym=10,
-    )
-    original = "Ciao!"
     protected = pipe.encode_message(original)
     recovered = pipe.decode_message(protected)
     assert original == recovered, (
@@ -64,17 +21,26 @@ def test_reed_solomon_with_xor():
         f"  original:  {original!r}\n"
         f"  recovered: {recovered!r}"
     )
-    print("[PASS] test_reed_solomon_with_xor")
+    print("[PASS] test_with_xor")
+
+
+def test_no_xor():
+    """RS correction code without XOR mask (xor_key=0 is effectively identity)."""
+    pipe = SteganoPipeline(xor_key=0, char_encoding="ASCII")
+    original = "Test123"
+    protected = pipe.encode_message(original)
+    recovered = pipe.decode_message(protected)
+    assert original == recovered, (
+        f"RS no-XOR roundtrip failed:\n"
+        f"  original:  {original!r}\n"
+        f"  recovered: {recovered!r}"
+    )
+    print("[PASS] test_no_xor")
 
 
 def test_unicode_roundtrip():
-    """Unicode + Reed-Solomon roundtrip."""
-    pipe = SteganoPipeline(
-        xor_key=77,
-        char_encoding="UNICODE",
-        error_correction_method="reed_solomon",
-        nsym=10,
-    )
+    """Unicode + RS roundtrip."""
+    pipe = SteganoPipeline(xor_key=77, char_encoding="UNICODE")
     original = "Ciao 🌍!"
     protected = pipe.encode_message(original)
     recovered = pipe.decode_message(protected)
@@ -88,12 +54,7 @@ def test_unicode_roundtrip():
 
 def test_empty_message():
     """Empty message should roundtrip cleanly."""
-    pipe = SteganoPipeline(
-        xor_key=42,
-        char_encoding="ASCII",
-        error_correction_method="vote",
-        burst_error_tolerance=3,
-    )
+    pipe = SteganoPipeline(xor_key=42, char_encoding="ASCII")
     assert pipe.encode_message("") == ""
     assert pipe.decode_message("") == ""
     print("[PASS] test_empty_message")
@@ -101,10 +62,7 @@ def test_empty_message():
 
 def test_build_from_options():
     """build_pipeline_from_options should return a working pipeline."""
-    # Simulate an Options-like object
     class FakeOptions:
-        error_correction_method = "vote"
-        burst_error_tolerance = 7
         xor_key = 123
         char_encoding = "ASCII"
 
@@ -137,9 +95,8 @@ def test_encoder_decoder_no_ecc_arg():
 
 
 if __name__ == "__main__":
-    test_vote_with_xor()
-    test_vote_no_xor()
-    test_reed_solomon_with_xor()
+    test_with_xor()
+    test_no_xor()
     test_unicode_roundtrip()
     test_empty_message()
     test_build_from_options()

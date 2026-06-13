@@ -29,29 +29,21 @@ def _options_to_dict(options: Options) -> dict:
         "to_gen_number": options.to_gen_number,
         "output_directory": options.output_directory,
         "random_generation": options.random_generation,
-        "max_error_ratio": options.max_error_ratio,
-        "burst_error_tolerance": options.burst_error_tolerance,
-        "error_correction_method": options.error_correction_method,
-        "rs_nsym": options.rs_nsym,
+        "ecc": "RS(nsym=5,block=10B)",
     }
 
 
 def _pipeline_to_dict(pipeline) -> dict:
     """Serialize pipeline configuration to a plain dict for JSON."""
+    from scripts.pipeline import RS_BLOCK_BYTES, RS_NSYM
     info = {
         "char_encoding": pipeline.char_encoding,
         "ecc_method": type(pipeline.ecc).__name__,
+        "rs_nsym": RS_NSYM,
+        "rs_block_bytes": RS_BLOCK_BYTES,
         "xor_key": pipeline.xor_mask.key,
         "header_protection": "embedded_in_rs",
     }
-
-    # Include ECC-specific parameters
-    ecc = pipeline.ecc
-    if hasattr(ecc, "burst_error_tolerance"):
-        info["burst_error_tolerance"] = ecc.burst_error_tolerance
-    if hasattr(ecc, "nsym"):
-        info["rs_nsym"] = ecc.nsym
-
     return info
 
 
@@ -80,10 +72,6 @@ def main():
         relative_options_file_path=args.relative_options_file,
         seed=args.seed,
         random_generation=args.random_generation,
-        max_error_ratio=args.max_error_ratio,
-        burst_error_tolerance=args.burst_error_tolerance,
-        error_correction_method=args.error_correction_method,
-        rs_nsym=args.rs_nsym,
     )
 
     if os.path.exists(options.output_directory):

@@ -47,33 +47,6 @@ def initialized_parser() -> ArgumentParser:
                         help='Whatever the code should generate even images with random sampling (top_k)')
     parser.add_argument('--without-random-generation',
                         dest='random_generation', action='store_false')
-    parser.add_argument('--burst-error-tolerance',
-                        type=int, required=False, default=7,
-                        help='Maximum number of consecutive bit errors the error correction (vote) can withstand. '
-                             'Default 7. The overhead is burst_error_tolerance * 2 + 1 times the original message size. '
-                             'Higher values protect against longer burst errors but add more redundancy. '
-                             'Used for the vote-protected length header.')
-    parser.add_argument('--max-error-ratio',
-                        type=float, required=False, default=0.2,
-                        help='(DEPRECATED) Use --burst-error-tolerance instead. '
-                             'Maximum tolerable bit error ratio for error correction (0.0 to 1.0). '
-                             'Default 0.2 means up to 20%% of bits can be corrected. '
-                             'Higher values add more redundancy but allow more error recovery.')
-    parser.add_argument('--error-correction-method',
-                        type=str, required=False, default='reed_solomon',
-                        choices=['vote', 'reed_solomon'],
-                        help='Error correction algorithm to use for the message body. '
-                             '"reed_solomon" uses Reed-Solomon block coding over GF(256) '
-                             'and can correct up to rs_nsym // 2 byte errors. '
-                             '"vote" uses full-message repetition with majority voting '
-                             '(burst-resistant). The length header is always vote-protected. '
-                             'Default: "reed_solomon".')
-    parser.add_argument('--rs-nsym',
-                        type=int, required=False, default=30,
-                        help='Number of ECC symbols for Reed-Solomon code. '
-                             'Can correct up to nsym // 2 erroneous bytes. '
-                             'Only used when --error-correction-method=reed_solomon. '
-                             'Default: 30 (corrects ~15 byte errors = ~30% of 50 bytes).')
     parser.add_argument('--xor-key',
                         type=int, required=False, default=None,
                         help='Optional integer key (0-255) for XOR obfuscation of the '
@@ -81,15 +54,19 @@ def initialized_parser() -> ArgumentParser:
     parser.add_argument('--char-encoding',
                         type=str, required=False, default='ASCII',
                         choices=['ASCII', 'UNICODE', 'DECIMAL'],
-                        help='Character encoding for str↔bits conversion. '
+                        help='Character encoding for strâ†"bits conversion. '
                              'Default: "ASCII".')
     parser.set_defaults(random_generation=False)
     return parser
+
 
 class Options:
     """
     Configuration class holding all settings for the steganography encoding and decoding process.
     Manages message, model paths, generation parameters, and output configurations.
+
+    Error correction uses Reed-Solomon with fixed nsym=5 on 10-byte blocks.
+    No user-configurable ECC parameters are exposed.
     """
 
     def __init__(
@@ -104,10 +81,6 @@ class Options:
         output_directory_path : Optional[str] = None,
         relative_options_file_path : Optional[str] = None,
         random_generation : bool = False,
-        max_error_ratio : float = 0.2,
-        burst_error_tolerance : int = 7,
-        error_correction_method : str = "reed_solomon",
-        rs_nsym : int = 30,
     ) -> None:
         """
         Initializes the Options object with user-specified or default parameters.
@@ -122,13 +95,6 @@ class Options:
             output_directory_path: Directory to save outputs.
             relative_options_file_path: Path for options JSON file.
             random_generation: If True, generates random images without messages.
-            max_error_ratio: (DEPRECATED) Maximum tolerable bit error ratio for error correction (0.0 to 1.0).
-                             Default 0.2 means up to 20% of bits can be corrected.
-            burst_error_tolerance: Maximum number of consecutive bit errors the vote correction
-                                   (for the length header) can withstand. Default 7.
-            error_correction_method: Error correction algorithm for the message body.
-                                     Default "reed_solomon".
-            rs_nsym: Number of ECC symbols for Reed-Solomon. Default 30.
 
         Raises:
             ArgumentError: If required parameters are invalid.
@@ -148,12 +114,6 @@ class Options:
         self.output_directory = output_directory_path or os.path.join("examples", str(datetime.datetime.now()))
         self.relative_options_file_path = relative_options_file_path or "options.json"
         self.random_generation = random_generation
-        self.max_error_ratio = max_error_ratio
-        # Convert max_error_ratio to burst_error_tolerance if the legacy parameter is used
-        # and burst_error_tolerance wasn't explicitly provided
-        self.burst_error_tolerance = burst_error_tolerance
-        self.error_correction_method = error_correction_method
-        self.rs_nsym = rs_nsym
 
     def save_as_file(self) -> None:
         """

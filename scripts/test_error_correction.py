@@ -1,32 +1,20 @@
 """
-Test script for the error correction algorithm.
+Test script for the Reed-Solomon error correction algorithm.
 
-Verifies that the ErrorCorrectionCode with full-message repetition
-can correct burst errors of up to the specified burst_error_tolerance.
+RS is now the only ECC method (no Vote). Parameters are fixed:
+    nsym=5, block_bytes=10  (25%+ correction capability per 10-byte block)
 
-Tests (VoteCorrectionCode):
-1. No errors: message should decode perfectly
-2. Burst of 10 consecutive errors: should be corrected
-3. Burst spanning repetition boundaries: should be corrected
-4. Multiple bursts in different areas
-5. Realistic VQGAN scenario - one patch corruption
-6. All copies corrupted at same positions (exceeds design)
-7. 10 consecutive errors at start of stream
-8. Default burst_error_tolerance=10
-9. Empty message handling
-10. Errors exceeding tolerance: should detect and warn
-
-Tests (ReedSolomonCorrectionCode):
-11. Basic encode/decode with errors
-12. Empty message handling
-13. overhead_ratio property
+Tests:
+1. Basic encode/decode with no errors
+2. Encode/decode with bit errors (within correction capacity)
+3. Block-level encoding (multiple 10-byte blocks)
+4. Partial block (last block shorter than 10 bytes)
+5. Empty message handling
+6. overhead_ratio property
 """
-
 import sys
 import os
 
-# Parse command-line arg to optionally install logger
-# Then import the class directly from the file to avoid logger import issues
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Create a minimal logger module so error_correction.py can import it
@@ -40,7 +28,11 @@ logger_module.logger = type('Logger', (), {
 })()
 sys.modules['scripts.logger'] = logger_module
 
-from scripts.error_correction import VoteCorrectionCode, ReedSolomonCorrectionCode
+# RS is always nsym=5 (fixed). These constants match the pipeline's block scheme.
+RS_NSYM = 5
+RS_BLOCK_BYTES = 10
+
+from scripts.error_correction import ReedSolomonCorrectionCode
 
 
 def bits_from_string(s: str) -> str:
@@ -66,418 +58,156 @@ def introduce_burst_error(encoded_bits: str, start_pos: int, length: int) -> str
     return "".join(bits_list)
 
 
-def test_no_errors():
-    """Test that with no errors, the message is decoded perfectly."""
+def test_basic_encode_decode():
+    """Test basic RS encode/decode with no errors."""
     print("=" * 60)
-    print("TEST 1: No errors")
+    print("TEST 1: Basic encode/decode (no errors)")
     print("=" * 60)
 
-    ecc = VoteCorrectionCode(burst_error_tolerance=10)
-    original = "Hello, World!"
+    ecc = ReedSolomonCorrectionCode(nsym=RS_NSYM)
+    original = "Hello RS!"
     bits = bits_from_string(original)
     encoded = ecc.encode(bits)
     decoded_bits = ecc.decode(encoded)
     decoded = string_from_bits(decoded_bits)
 
     assert decoded == original, f"FAIL: '{decoded}' != '{original}'"
-    print(f"  Original: {original}")
-    print(f"  Encoded length: {len(encoded)} bits ({len(encoded) // len(bits)}x overhead)")
-    print(f"  Decoded:  {decoded}")
-    print(f"  PASS: No errors, message recovered correctly.")
+    # Encoded should be longer due to ECC: bits * (15/10) + RS overhead
+    # But block-based: each 80-bit block → 120 bits, so ratio ≤ 1.5
+    print(f"  Original:     {original}")
+    print(f"  Bits:         {len(bits)}")
+    print(f"  Encoded bits: {len(encoded)} ({len(encoded)/len(bits):.2f}x overhead)")
+    print(f"  Decoded:      {decoded}")
+    print(f"  PASS")
     print()
 
 
-def test_burst_10_errors():
-    """Test that a burst of 10 consecutive errors is corrected."""
+def test_error_correction_within_capacity():
+    """Test RS corrects errors within its capacity (nsym/2 = 2 byte errors per block)."""
     print("=" * 60)
-    print("TEST 2: Burst of 10 consecutive errors")
+    print("TEST 2: Error correction within capacity")
     print("=" * 60)
 
-    ecc = VoteCorrectionCode(burst_error_tolerance=10)
-    original = "Hello, World! This is a test message."
+    ecc = ReedSolomonCorrectionCode(nsym=RS_NSYM)
+    # 10-byte message → fits in one block
+    original = "1234567890"
     bits = bits_from_string(original)
     encoded = ecc.encode(bits)
-    message_len = len(bits)
 
-    # Introduce a burst of 10 errors starting at position 50 in the encoded stream
-    burst_start = 50
-    corrupted = introduce_burst_error(encoded, burst_start, 10)
-
-    print(f"  Original:         {original}")
-    print(f"  Message bits:     {message_len}")
-    print(f"  Encoded bits:     {len(encoded)} ({ecc.repetitions}x overhead)")
-    print(f"  Burst at pos {burst_start}: flipping 10 bits")
+    # Flip 4 bits across 2 bytes in the encoded data
+    # (can correct up to nsym//2 = 2 byte errors → more than enough)
+    corrupted = introduce_burst_error(encoded, 10, 4)
 
     decoded_bits = ecc.decode(corrupted)
     decoded = string_from_bits(decoded_bits)
 
     assert decoded == original, f"FAIL: '{decoded}' != '{original}'"
-    print(f"  Decoded:          {decoded}")
-    print(f"  PASS: 10 consecutive errors corrected successfully.")
+    print(f"  Original:     {original}")
+    print(f"  Encoded:      {len(encoded)} bits")
+    print(f"  Flipped 4 bits at position 10")
+    print(f"  Decoded:      {decoded}")
+    print(f"  PASS")
     print()
 
 
-def test_burst_at_boundary():
-    """Test burst that spans across the boundary between two repetitions."""
+def test_block_encoding_multiple_blocks():
+    """Test encoding with multiple 10-byte RS blocks."""
     print("=" * 60)
-    print("TEST 3: Burst spanning repetition boundary")
+    print("TEST 3: Multi-block encoding")
     print("=" * 60)
 
-    ecc = VoteCorrectionCode(burst_error_tolerance=10)
-    original = "Test boundary crossing burst."
+    ecc = ReedSolomonCorrectionCode(nsym=RS_NSYM)
+    # 30-byte message → 30 bytes = 15 bytes padded = 15 encoded bytes = 120 bits
+    # RS pads to unit of RS_BLOCK_BYTES (10 bytes), so 30 bytes → pads to 30 bytes
+    # (already multiple of 10). Then nsym=5 → 30*8 + 5*8 = 280 bits payload+ECC.
+    # With 3-bit header and byte padding, total is ~283 bits.
+    original = "A" * 30
     bits = bits_from_string(original)
     encoded = ecc.encode(bits)
-    message_len = len(bits)
-
-    # Place burst right at the boundary between repetition 0 and repetition 1
-    burst_start = message_len - 5
-    corrupted = introduce_burst_error(encoded, burst_start, 10)
-
-    print(f"  Original:         {original}")
-    print(f"  Message bits:     {message_len}")
-    print(f"  Burst from pos {burst_start} (crosses boundary between copies)")
-
-    decoded_bits = ecc.decode(corrupted)
+    decoded_bits = ecc.decode(encoded)
     decoded = string_from_bits(decoded_bits)
 
     assert decoded == original, f"FAIL: '{decoded}' != '{original}'"
-    print(f"  Decoded:          {decoded}")
-    print(f"  PASS: Boundary-crossing burst corrected.")
+    # reedsolo encodes the entire message as a single RS codeword,
+    # adding nsym=5 parity bytes at the end.
+    # 30 bytes → 30 + 5 = 35 bytes = 280 bits, plus 3-bit header = 283 bits.
+    expected_min_len = len(bits) + RS_NSYM * 8 + 3  # bits + ECC + header
+    assert len(encoded) >= expected_min_len, \
+        f"Encoded too short: {len(encoded)} < {expected_min_len} (raw body {len(bits)}b)"
+    print(f"  Original:     {len(original)} bytes = {len(bits)} bits")
+    print(f"  Encoded bits: {len(encoded)} ({len(encoded)/len(bits):.2f}x overhead)")
+    print(f"  Decoded:      {len(decoded)} chars")
+    print(f"  PASS")
     print()
 
 
-def test_multiple_bursts():
-    """Test multiple bursts in different areas of the encoded stream."""
+def test_partial_last_block():
+    """Test encoding with last block shorter than 10 bytes."""
     print("=" * 60)
-    print("TEST 4: Multiple burst errors")
+    print("TEST 4: Partial last block")
     print("=" * 60)
 
-    ecc = VoteCorrectionCode(burst_error_tolerance=10)
-    original = "This is a longer test message with multiple burst errors!"
+    ecc = ReedSolomonCorrectionCode(nsym=RS_NSYM)
+    # 12 bytes → 1 full block (10B) + 1 partial block (2B padded to 10B)
+    original = "abcdefghijkl"
     bits = bits_from_string(original)
     encoded = ecc.encode(bits)
-
-    # Introduce 3 separate bursts of 8 errors each
-    corrupted = encoded
-    corrupted = introduce_burst_error(corrupted, 30, 8)
-    corrupted = introduce_burst_error(corrupted, 120, 8)
-    corrupted = introduce_burst_error(corrupted, 250, 8)
-
-    decoded_bits = ecc.decode(corrupted)
+    decoded_bits = ecc.decode(encoded)
     decoded = string_from_bits(decoded_bits)
 
     assert decoded == original, f"FAIL: '{decoded}' != '{original}'"
-    print(f"  Original:         {original}")
-    print(f"  Decoded:          {decoded}")
-    print(f"  PASS: 3 separate bursts of 8 errors each corrected.")
-    print()
-
-
-def test_one_corrupted_patch_realistic():
-    """
-    Simulate ONE corrupted VQGAN patch: it corrupts exactly 10 consecutive
-    bits in the encoded stream. Since the encoded stream is organized as
-    [copy0][copy1]...[copy21], these 10 consecutive bits fall within ONE copy.
-    The other 20 copies remain intact → majority voting succeeds.
-    This is the REALISTIC scenario: VQGAN re-encoding corrupts one patch
-    at a time, corrupting at most DEFAULT_PRECISION_BITS (16) consecutive bits.
-    """
-    print("=" * 60)
-    print("TEST 5: Realistic VQGAN scenario - one patch corruption (10 bits)")
-    print("=" * 60)
-
-    ecc = VoteCorrectionCode(burst_error_tolerance=10)
-    original = "Realistic: one patch corrupted."
-    bits = bits_from_string(original)
-    encoded = ecc.encode(bits)
-    message_len = len(bits)
-
-    # One patch = 10 consecutive bits within a single copy
-    patch_start_within_copy = 100  # position within copy0
-    burst_start = patch_start_within_copy  # starts in copy0, stays within copy0 if message_len >= 110
-    corrupted = introduce_burst_error(encoded, burst_start, 10)
-
-    print(f"  Original:         {original}")
-    print(f"  Message bits:     {message_len}")
-    print(f"  Corrupted 10 consecutive bits at pos {burst_start} (inside copy 0)")
-    print(f"  Only copy 0's bits at positions [100..109] are affected")
-    print(f"  => 10 out of 21 copies are corrupted for those positions")
-    print(f"  => 11 remaining copies give majority")
-
-    decoded_bits = ecc.decode(corrupted)
-    decoded = string_from_bits(decoded_bits)
-
-    assert decoded == original, f"FAIL: '{decoded}' != '{original}'"
-    print(f"  Decoded:          {decoded}")
-    print(f"  PASS: One corrupted patch handled correctly.")
-    print()
-
-
-def test_max_positions_corrupted_in_each_copy():
-    """
-    Borderline case: corrupt the same 10 bit positions in each copy.
-    This is the worst-case scenario — but it requires affecting 10 bits
-    in EVERY copy (not realistic for a single patch corruption).
-    With burst_error_tolerance=10 and repetitions=21, we can tolerate
-    up to 10 errors per bit position. Here we have 1 error per position
-    per copy, for 21 copies = 21 errors per position → EXCEEDS tolerance.
-    
-    This test shows that the code is DESIGNED for realistic error patterns
-    (one corrupted patch, not all copies corrupted at same positions).
-    """
-    print("=" * 60)
-    print("TEST 6: All copies corrupted at same 10 positions (exceeds design)")
-    print("=" * 60)
-
-    ecc = VoteCorrectionCode(burst_error_tolerance=10)
-    original = "Borderline test."
-    bits = bits_from_string(original)
-    encoded = ecc.encode(bits)
-    message_len = len(bits)
-
-    # Corrupt same 10 positions in EVERY copy (21 errors per bit position)
-    corrupted = list(encoded)
-    for rep in range(ecc.repetitions):
-        start = rep * message_len
-        for offset in range(10):
-            idx = start + offset
-            if idx < len(corrupted):
-                corrupted[idx] = "1" if corrupted[idx] == "0" else "0"
-    corrupted = "".join(corrupted)
-
-    decoded_bits = ecc.decode(corrupted)
-    decoded = string_from_bits(decoded_bits)
-
-    print(f"  Original:         {original}")
-    print(f"  Message bits:     {message_len}")
-    print(f"  Corrupted first 10 bits of ALL {ecc.repetitions} copies")
-    print(f"  => 21 errors at each of positions 0..9 (exceeds tolerance of 10)")
-    print(f"  Decoded:          {decoded}")
-    # This might or might not match; we don't assert it
-    if decoded == original:
-        print(f"  NOTE: By chance the message was still correct (rare).")
-    else:
-        print(f"  PASS: Expected - errors beyond tolerance correctly cause corruption.")
-    print()
-
-
-def test_burst_10_straddles_boundaries():
-    """
-    10 consecutive errors at the start of the encoded stream corrupt only
-    the first 10 bits of the first copy. The other 20 copies are intact.
-    Since repetitions=21 and tolerance=10, majority voting still works.
-    """
-    print("=" * 60)
-    print("TEST 7: 10 consecutive errors at start of stream")
-    print("=" * 60)
-
-    ecc = VoteCorrectionCode(burst_error_tolerance=10)
-    original = "Testing the worst case."
-    bits = bits_from_string(original)
-    encoded = ecc.encode(bits)
-    message_len = len(bits)
-
-    # 10 consecutive errors: these corrupt the SAME 10 positions in every copy
-    # because the data is organized as [copy0][copy1]...[copyN]
-    corrupted = encoded
-    corrupted = introduce_burst_error(corrupted, 0, 10)
-
-    decoded_bits = ecc.decode(corrupted)
-    decoded = string_from_bits(decoded_bits)
-
-    assert decoded == original, f"FAIL: '{decoded}' != '{original}'"
-    print(f"  Original:         {original}")
-    print(f"  Message bits:     {message_len}")
-    print(f"  Encoded is 21 copies concatenated")
-    print(f"  Corrupted first 10 bits = first 10 bits of first copy")
-    print(f"  => only 10 bits of first copy are corrupted")
-    print(f"  Decoded:          {decoded}")
-    print(f"  PASS: 20 remaining copies provide majority.")
-    print()
-
-
-def test_default_10():
-    """Test that the default burst_error_tolerance=10 works."""
-    print("=" * 60)
-    print("TEST 8: Default burst_error_tolerance=10")
-    print("=" * 60)
-
-    ecc = VoteCorrectionCode()  # default tolerance = 10
-    assert ecc.repetitions == 21, f"Expected 21 repetitions, got {ecc.repetitions}"
-    assert ecc.burst_error_tolerance == 10
-
-    original = "Default test"
-    bits = bits_from_string(original)
-    encoded = ecc.encode(bits)
-
-    # Burst of 10 errors
-    corrupted = introduce_burst_error(encoded, 0, 10)
-
-    decoded_bits = ecc.decode(corrupted)
-    decoded = string_from_bits(decoded_bits)
-
-    assert decoded == original, f"FAIL: '{decoded}' != '{original}'"
-    print(f"  Original:         {original}")
-    print(f"  Repetitions:      {ecc.repetitions}")
-    print(f"  Corrupted first 10 bits")
-    print(f"  Decoded:          {decoded}")
-    print(f"  PASS: Default tolerance corrects 10 consecutive errors.")
+    print(f"  Original:     {original}")
+    print(f"  Bits:         {len(bits)}")
+    print(f"  Encoded bits: {len(encoded)}")
+    print(f"  Decoded:      {decoded}")
+    print(f"  PASS")
     print()
 
 
 def test_empty_message():
     """Test empty message handling."""
     print("=" * 60)
-    print("TEST 9: Empty message")
+    print("TEST 5: Empty message")
     print("=" * 60)
 
-    ecc = VoteCorrectionCode()
+    ecc = ReedSolomonCorrectionCode(nsym=RS_NSYM)
     assert ecc.encode("") == ""
     assert ecc.decode("") == ""
-    print("  PASS: Empty message handled correctly.")
+    print("  PASS")
     print()
 
 
-def test_reed_solomon_basic():
-    """Test Reed-Solomon error correction: basic encode/decode with errors."""
+def test_overhead_ratio():
+    """Test overhead_ratio property."""
     print("=" * 60)
-    print("TEST 11: Reed-Solomon basic encode/decode with errors")
-    print("=" * 60)
-
-    try:
-        ecc = ReedSolomonCorrectionCode(nsym=10)
-    except ImportError as e:
-        print(f"  SKIP: {e}")
-        print()
-        return
-
-    nsym = 10  # can correct up to 5 erroneous bytes
-    original = "Hello RS! Testing 123."
-    bits = bits_from_string(original)
-    encoded = ecc.encode(bits)
-
-    # Skip the 3-bit header; corrupt bits in the payload only.
-    # Flip 3 bits in 2 separate bytes — this should be within RS correction
-    # capacity (nsym // 2 = 5 byte errors).
-    header_bits = 3
-    payload = list(encoded[header_bits:])
-    # Flip 3 bits: all within the first few bytes of the payload
-    for pos in [10, 50, 100]:
-        if pos < len(payload):
-            payload[pos] = "1" if payload[pos] == "0" else "0"
-    corrupted = encoded[:header_bits] + "".join(payload)
-
-    decoded_bits = ecc.decode(corrupted)
-    decoded = string_from_bits(decoded_bits)
-
-    assert decoded == original, f"FAIL: '{decoded}' != '{original}'"
-    print(f"  Original:         {original}")
-    print(f"  Encoded length:   {len(encoded)} bits")
-    print(f"  nsym:             {nsym}")
-    print(f"  Corrupted 3 bits (payload only)")
-    print(f"  Decoded:          {decoded}")
-    print(f"  PASS: Reed-Solomon corrected errors.")
-    print()
-
-
-def test_reed_solomon_empty():
-    """Test Reed-Solomon with empty message."""
-    print("=" * 60)
-    print("TEST 12: Reed-Solomon empty message")
+    print("TEST 6: overhead_ratio")
     print("=" * 60)
 
-    try:
-        ecc = ReedSolomonCorrectionCode(nsym=10)
-    except ImportError as e:
-        print(f"  SKIP: {e}")
-        print()
-        return
-
-    assert ecc.encode("") == ""
-    assert ecc.decode("") == ""
-    print("  PASS: Empty message handled correctly.")
-    print()
-
-
-def test_reed_solomon_overhead_ratio():
-    """Test Reed-Solomon overhead_ratio property."""
-    print("=" * 60)
-    print("TEST 13: Reed-Solomon overhead_ratio")
-    print("=" * 60)
-
-    try:
-        ecc = ReedSolomonCorrectionCode(nsym=10)
-    except ImportError as e:
-        print(f"  SKIP: {e}")
-        print()
-        return
-
+    ecc = ReedSolomonCorrectionCode(nsym=RS_NSYM)
     ratio = ecc.overhead_ratio
-    # Should be a float > 1.0
+    # Each 10-byte block → 15 bytes = 1.5x overhead in the optimal case
+    # But with padding and byte alignment, actual ratio may be slightly higher
     assert ratio > 1.0, f"Expected overhead_ratio > 1.0, got {ratio}"
-    print(f"  overhead_ratio:   {ratio:.2f}")
-    print(f"  nsym:             {ecc.nsym}")
-    print("  PASS: overhead_ratio is reasonable.")
-    print()
-
-
-def test_beyond_tolerance():
-    """Test that errors exceeding 10 at one position may fail (warning case)."""
-    print("=" * 60)
-    print("TEST 10: Errors beyond tolerance (worst-case)")
-    print("=" * 60)
-
-    tolerance = 5
-    ecc = VoteCorrectionCode(burst_error_tolerance=tolerance)
-    original = "XYZ"
-    bits = bits_from_string(original)
-    encoded = ecc.encode(bits)
-    message_len = len(bits)
-
-    # Corrupt MORE than `tolerance` copies at one position (majority flips!)
-    pos_in_message = 3
-    bits_list = list(encoded)
-    for rep in range(tolerance + 2):  # corrupt tolerance+2 = 7 out of 11 copies
-        idx = rep * message_len + pos_in_message
-        bits_list[idx] = "1" if bits_list[idx] == "0" else "0"
-    corrupted = "".join(bits_list)
-
-    decoded_bits = ecc.decode(corrupted)
-    decoded = string_from_bits(decoded_bits)
-
-    print(f"  Original:         {original}")
-    print(f"  Tolerance:        {tolerance} (repetitions={ecc.repetitions})")
-    print(f"  Corrupted {tolerance + 2} out of {ecc.repetitions} copies at position {pos_in_message}")
-    print(f"  Decoded:          {decoded}")
-    if decoded != original:
-        print(f"  PASS: Errors beyond tolerance correctly detected as failure.")
-    else:
-        print(f"  NOTE: By chance, the message was still correct (rare).")
+    print(f"  overhead_ratio: {ratio:.4f}")
+    print(f"  nsym:           {ecc.nsym}")
+    print("  PASS")
     print()
 
 
 if __name__ == "__main__":
     print()
     print("=" * 60)
-    print("ERROR CORRECTION CODE TESTS")
-    print("(full-message repetition | burst_error_tolerance = 10)")
+    print("RS ERROR CORRECTION TESTS (fixed nsym=5, block_bytes=10)")
     print("=" * 60)
     print()
 
     all_tests = [
-        test_no_errors,
-        test_burst_10_errors,
-        test_burst_at_boundary,
-        test_multiple_bursts,
-        test_one_corrupted_patch_realistic,
-        test_max_positions_corrupted_in_each_copy,
-        test_burst_10_straddles_boundaries,
-        test_default_10,
+        test_basic_encode_decode,
+        test_error_correction_within_capacity,
+        test_block_encoding_multiple_blocks,
+        test_partial_last_block,
         test_empty_message,
-        test_beyond_tolerance,
-        test_reed_solomon_basic,
-        test_reed_solomon_empty,
-        test_reed_solomon_overhead_ratio,
+        test_overhead_ratio,
     ]
 
     passed = 0

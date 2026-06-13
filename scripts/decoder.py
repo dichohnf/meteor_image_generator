@@ -1,10 +1,17 @@
 """
-Steganographic decoder with interleaved Reed-Solomon error correction.
+Steganographic decoder with block-wise Reed-Solomon error correction.
 
 Extracts hidden bits from image patches using arithmetic coding, but applies
-RS error correction *incrementally* as bits are decoded — not after the fact. 
-This prevents a single corrupted patch from poisoning the context for all
+RS error correction *incrementally* per RS block — not on the entire message
+at once.  Each fixed-size RS block (10 payload bytes + 5 ECC bytes) is decoded
+as soon as enough bits are received.  When RS corrects errors within a block,
+the corresponding patches are re-selected to prevent context poisoning of
 subsequent patches.
+
+Constants (must match pipeline):
+    RS_BLOCK_BYTES = 10      # payload bytes per RS block
+    RS_NSYM = 5              # ECC parity symbols per block
+    RS_PAYLOAD_BITS = 80     # 10 × 8
 """
 
 import math
@@ -24,8 +31,21 @@ from scripts.utils import (
 )
 from scripts.logger import logger
 from scripts.stats import DecodingStatistics
-from scripts.error_correction import ErrorCorrectionFactory, ErrorCorrectionCode
+
+# We no longer import ErrorCorrectionFactory — use ReedSolomonCorrectionCode directly
+from scripts.error_correction import ReedSolomonCorrectionCode
 from scripts.pipeline import HEADER_LENGTH_BITS, XorMask
+
+# Block-wise RS parameters (must match pipeline.py)
+RS_NSYM = 5
+RS_BLOCK_BYTES = 10
+RS_PAYLOAD_BITS = RS_BLOCK_BYTES * 8  # 80
+
+# How many bits after XOR undo are needed for one RS block (variable due to 3-bit padding header)
+# Maximum possible: 3 padding header bits + (15 bytes * 8) = 123 bits
+# Minimum possible: 3 padding header bits + (1 byte * 8) = 11 bits (bad case)
+RS_ENCODED_MAX_BITS = 3 + (RS_BLOCK_BYTES + RS_NSYM) * 8  # 123
+RS_ENCODED_MIN_BITS = 3 + 8  # 11
 
 
 # ======================================================================
@@ -117,6 +137,67 @@ def _reselect_patch(
 
 
 # ======================================================================
+#  Block-wise RS management
+# ======================================================================
+
+class RsBlockAccumulator:
+    """
+    Accumulates bits for a single RS block and attempts decode when enough
+    bits are received.  Tracks which patch(es) contributed to this block.
+
+    Because RS-encoded blocks have a variable size (3-bit padding header +
+    encoded bytes), we use a heuristic: we try to decode as soon as we
+    have at least *RS_ENCODED_MIN_BITS* and then extend the candidate
+    window until decode succeeds.
+    """
+
+    def __init__(self, ecc: ReedSolomonCorrectionCode) -> None:
+        self.ecc = ecc
+        self.accumulated_bits: List[str] = []       # XOR-undoed bits for this block
+        self.patch_indices: List[int] = []           # global patch indices in this block
+        self.bit_length: int = 0                     # bits accumulated so far
+
+    def add_bits(self, bits: str, patch_global_idx: int) -> None:
+        """Append bits (XOR already undone) and record which patch they came from."""
+        self.accumulated_bits.append(bits)
+        self.patch_indices.append(patch_global_idx)
+        self.bit_length += len(bits)
+
+    @property
+    def raw_bits(self) -> str:
+        """All accumulated bits concatenated."""
+        return "".join(self.accumulated_bits)
+
+    @property
+    def is_complete(self) -> bool:
+        """
+        Check if we have enough bits for a complete RS block.
+        We can decide based on the accumulated length.
+        """
+        return self.bit_length >= RS_ENCODED_MIN_BITS and self._try_decode() is not None
+
+    def try_decode(self) -> Optional[str]:
+        """
+        Attempt to RS-decode the accumulated bits.  Returns the decoded
+        payload (without RS overhead) on success, or None on failure.
+        """
+        return self._try_decode()
+
+    def _try_decode(self) -> Optional[str]:
+        """Internal: try to RS-decode, return decoded payload bits or None."""
+        raw = self.raw_bits
+        if len(raw) < RS_ENCODED_MIN_BITS:
+            return None
+        try:
+            decoded = self.ecc.decode(raw)
+            if decoded:
+                return decoded
+        except Exception:
+            pass
+        return None
+
+
+# ======================================================================
 #  Decoder
 # ======================================================================
 
@@ -132,9 +213,10 @@ class SteganographyDecoder:
     Handles the decoding of hidden messages from steganographic images using arithmetic coding.
     This class extracts embedded bits from image patches and reconstructs the original message.
 
-    RS error correction is applied *incrementally* as bits are decoded from patches.
-    If the RS decoder detects and corrects errors, the affected patch indices in the
-    ``building_tensor`` are also corrected, preventing context poisoning of future patches.
+    RS error correction is applied *block-wise* as bits are decoded from patches.
+    Each 10-byte RS block is decoded independently.  If RS detects and corrects errors
+    within a block, the affected patch indices in the ``building_tensor`` are re-selected,
+    preventing context poisoning of future patches.
     """
 
     def __init__(
@@ -255,9 +337,10 @@ class SteganographyDecoder:
         """
         Decode the hidden message from a steganographic image.
 
-        RS error correction is applied *incrementally* as bits are decoded.
-        When a block of bytes is successfully RS-corrected, the corresponding
-        patches are re-selected so that the context remains correct.
+        Block-wise RS error correction is applied incrementally:
+        bits are accumulated until a complete RS block can be decoded
+        (a maximum of 123 bits after XOR undo).  When a block is successfully
+        decoded, any corrected bits trigger re-selection of the corresponding patches.
 
         Args:
             options: Configuration options.
@@ -298,23 +381,24 @@ class SteganographyDecoder:
             xor_key = getattr(options, "xor_key", 123)
             xor_mask = XorMask(xor_key)
 
-        # Build ECC decoder
-        ecc: ErrorCorrectionCode = ErrorCorrectionFactory.create(
-            getattr(options, "error_correction_method", "reed_solomon"),
-            nsym=getattr(options, "rs_nsym", 30),
-        )
+        # Fixed RS ECC — no user configuration
+        ecc = ReedSolomonCorrectionCode(nsym=RS_NSYM)
 
         # ------------------------------------------------------------------
         #  Buffers
         # ------------------------------------------------------------------
-        all_bits_aligned: List[str] = []       # bits after XOR undo = RS-encoded body (header inside)
         patch_records: List[PatchRecord] = []
         header_decoded = False
         message_bit_length: int = 0
-        target_body_len: int = 0               # bits of body (before RS) needed to reach decoded_len
-        corrections_locked = False             # Task 4: anti-loop fingerprint
+        header_payload_bits: int = 0   # bits of header + message payload (before RS)
+        corrections_locked = False
         seen_patch_fingerprints: Set[FrozenSet[int]] = set()
-        BIT_MARGIN = 16                        # slack for target_body_len calculation
+        ENOUGH_BIT_MARGIN = 16
+
+        # Block-wise RS accumulation
+        current_rs_block = RsBlockAccumulator(ecc)
+        decoded_payload_blocks: List[str] = []  # decoded payload bits across all blocks
+        total_accumulated_bits: List[str] = []  # all XOR-undoed bits (for header detection + full trace)
 
         total_remaining = (grid_shape[0] - current_row) * grid_shape[1] - current_col
         with tqdm(total=total_remaining, desc="Decoding message", disable=True) as pbar:
@@ -337,12 +421,17 @@ class SteganographyDecoder:
                 actual_token = stego_indices[prev_row, prev_col].item()
                 success = selected_idx != -1
 
-                # Accumulate raw bits
+                # Accumulate raw bits (with XOR still applied — returned at end)
                 decoded_bits += token_bits
 
-                # Undo XOR and accumulate aligned bits
+                # Undo XOR for RS processing
                 bits_plain = xor_mask.apply(token_bits)
-                all_bits_aligned.append(bits_plain)
+
+                # Store in global accumulation buffer
+                total_accumulated_bits.append(bits_plain)
+
+                # Add to current RS block accumulator
+                current_rs_block.add_bits(bits_plain, patch_index)
 
                 # Store patch record
                 patch_rec = PatchRecord(
@@ -366,140 +455,131 @@ class SteganographyDecoder:
                 patch_index += 1
 
                 # ----------------------------------------------------------
-                #  Phase 1 — Extract header from RS-decoded body (once)
+                #  Phase 1 — Try to decode current RS block
                 # ----------------------------------------------------------
-                if not header_decoded:
-                    body_bits = "".join(all_bits_aligned)
-                    # Need at least nsym+1 bytes + 3 bits RS header to attempt decode
-                    if len(body_bits) >= 8 * (ecc.nsym + 1) + 3:
-                        try:
-                            decoded_body = ecc.decode(body_bits)
-                            decoded_len = int(decoded_body[:HEADER_LENGTH_BITS], 2)
-                            max_bits = (1 << HEADER_LENGTH_BITS) - 1
-                            if 0 < decoded_len <= max_bits:
-                                message_bit_length = decoded_len
-                                header_decoded = True
-                                # Calculate how many body bits (before RS) are needed
-                                rs_payload_bits = ((decoded_len + HEADER_LENGTH_BITS + 7) // 8) * 8 + 3
-                                target_body_len = len(ecc.encode("0" * rs_payload_bits))
-                                logger.info(
-                                    f"[Decoder] Header decoded from RS body: "
-                                    f"message length = {decoded_len} bits, "
-                                    f"target body = {target_body_len} bits"
-                                )
-                            else:
-                                logger.warning(
-                                    f"[Decoder] Invalid header length {decoded_len}"
-                                )
-                        except Exception:
-                            pass  # keep accumulating bits
-                    continue
+                decoded_payload = current_rs_block.try_decode()
+                if decoded_payload is not None:
+                    encoded_bits = current_rs_block.raw_bits
+                    logger.info(
+                        f"[Decoder] RS block {len(decoded_payload_blocks)} decoded: "
+                        f"{len(encoded_bits)}b → {len(decoded_payload)}b "
+                        f"({len(current_rs_block.patch_indices)} patches)"
+                    )
+
+                    # Check if corrections were made
+                    re_encoded = ecc.encode(decoded_payload)
+                    if re_encoded != encoded_bits[:len(re_encoded)] and not corrections_locked:
+                        n_diff = sum(
+                            1 for a, b in zip(encoded_bits[:len(re_encoded)], re_encoded)
+                            if a != b
+                        )
+                        logger.info(
+                            f"[Decoder] RS block corrected {n_diff} bit errors — "
+                            f"re-selecting patches"
+                        )
+                        self._fix_patches_from_rs_block(
+                            reference_tensor, building_tensor,
+                            patch_records[:patch_index],
+                            current_rs_block.patch_indices,
+                            encoded_bits, re_encoded,
+                            selected_indices_list,
+                            seen_patch_fingerprints,
+                        )
+
+                    # Store decoded payload and reset block accumulator
+                    decoded_payload_blocks.append(decoded_payload)
+                    current_rs_block = RsBlockAccumulator(ecc)
 
                 # ----------------------------------------------------------
-                #  Phase 2 — Early termination if we have enough bits
+                #  Phase 2 — Extract header from first decoded block
                 # ----------------------------------------------------------
-                if header_decoded and target_body_len > 0:
-                    bits_so_far = len("".join(all_bits_aligned))
-                    if bits_so_far >= target_body_len - BIT_MARGIN:
+                if not header_decoded and len(decoded_payload_blocks) > 0:
+                    # Concatenate all decoded payload blocks so far
+                    full_decoded = "".join(decoded_payload_blocks)
+                    if len(full_decoded) >= HEADER_LENGTH_BITS:
+                        decoded_len = int(full_decoded[:HEADER_LENGTH_BITS], 2)
+                        max_bits = (1 << HEADER_LENGTH_BITS) - 1
+                        if 0 < decoded_len <= max_bits:
+                            message_bit_length = decoded_len
+                            header_decoded = True
+                            # Calculate how many body bits are needed (before RS)
+                            # We need: header (13) + message bits + padding to byte boundary
+                            needed_payload_bits = (
+                                (decoded_len + HEADER_LENGTH_BITS + 7) // 8
+                            ) * 8
+                            # Each RS block contributes RS_PAYLOAD_BITS of decoded payload
+                            # (last block may be smaller)
+                            header_payload_bits = needed_payload_bits
+                            logger.info(
+                                f"[Decoder] Header decoded: message length = {decoded_len} bits, "
+                                f"need {needed_payload_bits} payload bits"
+                            )
+
+                # ----------------------------------------------------------
+                #  Phase 3 — Early termination
+                # ----------------------------------------------------------
+                if header_decoded and header_payload_bits > 0:
+                    full_decoded = "".join(decoded_payload_blocks)
+                    if len(full_decoded) >= header_payload_bits - ENOUGH_BIT_MARGIN:
                         logger.info(
-                            f"[Decoder] Reached target body length "
-                            f"({bits_so_far} >= {target_body_len} - {BIT_MARGIN}) — stopping"
+                            f"[Decoder] Reached target payload "
+                            f"({len(full_decoded)} >= {header_payload_bits} - "
+                            f"{ENOUGH_BIT_MARGIN}) — stopping"
                         )
                         break
-
-                # ----------------------------------------------------------
-                #  Phase 3 — RS correction interleaved
-                #
-                #  Try to ECC-decode the accumulated body bits.
-                #  If it succeeds and errors were found, re-select patches.
-                # ----------------------------------------------------------
-                body_bits = "".join(all_bits_aligned)
-
-                if len(body_bits) >= 8 * (ecc.nsym + 1) + 3 and not corrections_locked:
-                    try:
-                        decoded_body = ecc.decode(body_bits)
-                        logger.info(
-                            f"[Decoder] RS decode successful "
-                            f"({len(body_bits)} body bits → {len(decoded_body)} msg bits)"
-                        )
-                        corrected_body = ecc.encode(decoded_body)
-                        min_len = min(len(body_bits), len(corrected_body))
-                        orig_slice = body_bits[:min_len]
-                        corr_slice = corrected_body[:min_len]
-
-                        if orig_slice != corr_slice:
-                            n_errors = sum(1 for a, b in zip(orig_slice, corr_slice) if a != b)
-                            logger.info(
-                                f"[Decoder] RS corrected {n_errors} bit errors"
-                            )
-                            self._fix_patches_from_correction(
-                                reference_tensor, building_tensor,
-                                patch_records, 0,  # header_len_bits = 0 (no vote header)
-                                orig_slice, corr_slice,
-                                selected_indices_list,
-                                seen_patch_fingerprints,
-                            )
-                        else:
-                            logger.info("[Decoder] RS verified — no corrections needed")
-
-                    except Exception as ex:
-                        logger.info(
-                            f"[Decoder] RS decode failed ({type(ex).__name__}) — "
-                            f"need more bits (have {len(body_bits)})"
-                        )
 
         # Return raw bits (with XOR) — pipeline will undo XOR later
         return decoded_bits, decoded_bits, selected_indices_list, stats
 
     # ------------------------------------------------------------------
-    #  Helper: fix patches after RS correction
+    #  Helper: fix patches from RS block correction
     # ------------------------------------------------------------------
 
-    def _fix_patches_from_correction(
+    def _fix_patches_from_rs_block(
         self,
         reference_tensor: torch.Tensor,
         building_tensor: torch.Tensor,
         patch_records: List[PatchRecord],
-        header_len_bits: int,
-        original_bits: str,
-        corrected_bits: str,
+        block_patch_indices: List[int],
+        original_encoded_bits: str,
+        re_encoded_bits: str,
         selected_indices_list: List[int],
-        seen_patch_fingerprints: Optional[Set[FrozenSet[int]]] = None,
+        seen_patch_fingerprints: Set[FrozenSet[int]],
     ) -> None:
         """
-        Compare original (pre-RS) body bits with corrected body bits.
-        For each bit that changed, find the corresponding patch(es)
-        and re-select the correct codebook index.
+        Compare original (received but XOR-undoed) RS-encoded bits with the
+        re-encoded version after RS decode+encode.  If bits differ, re-select
+        the affected patches.
         """
-        min_len = min(len(original_bits), len(corrected_bits))
+        min_len = min(len(original_encoded_bits), len(re_encoded_bits))
         if min_len == 0:
             return
 
         diff_positions = [
             i for i in range(min_len)
-            if original_bits[i] != corrected_bits[i]
+            if original_encoded_bits[i] != re_encoded_bits[i]
         ]
         if not diff_positions:
             return
 
         logger.info(
             f"[Decoder] RS correction: {len(diff_positions)} bit differences "
-            f"over {min_len} bits — fixing patches"
+            f"over {min_len} bits — fixing patches in block"
         )
 
-        # Build cumulative bit offset map: patch_index → (start_bit, end_bit) in body
-        patch_map = []
+        # Build cumulative bit offset map for patches within this block
+        block_patch_map = []
         bit_offset = 0
-        for pi, pr in enumerate(patch_records):
-            pb = pr.token_bits
-            # Undo XOR on these bits too for proper alignment
-            aligned_len = len(pb)  # same length, XOR doesn't change length
-            patch_map.append((pi, bit_offset, bit_offset + aligned_len))
-            bit_offset += aligned_len
+        for pi in block_patch_indices:
+            if pi < len(patch_records):
+                pr = patch_records[pi]
+                aligned_len = len(pr.token_bits)  # same as bits_plain
+                block_patch_map.append((pi, bit_offset, bit_offset + aligned_len))
+                bit_offset += aligned_len
 
-        # Find which patches overlap with corrected regions
+        # Find which patches overlap with corrected regions within this block
         patches_to_fix = set()
-        for pi, start, end in patch_map:
+        for pi, start, end in block_patch_map:
             for dp in diff_positions:
                 if start <= dp < end:
                     patches_to_fix.add(pi)
@@ -508,17 +588,15 @@ class SteganographyDecoder:
         if not patches_to_fix:
             return
 
-        # Task 4: Anti-loop fingerprint — if we've already corrected these
-        # same patches before without any change, lock further corrections.
-        if seen_patch_fingerprints is not None:
-            patch_fingerprint = frozenset(sorted(patches_to_fix))
-            if patch_fingerprint in seen_patch_fingerprints:
-                logger.warning(
-                    f"[Decoder] Same patches {sorted(patches_to_fix)} "
-                    f"keep getting corrected — locking further corrections"
-                )
-                return
-            seen_patch_fingerprints.add(patch_fingerprint)
+        # Anti-loop fingerprint
+        patch_fingerprint = frozenset(sorted(patches_to_fix))
+        if patch_fingerprint in seen_patch_fingerprints:
+            logger.warning(
+                f"[Decoder] Same patches {sorted(patches_to_fix)} "
+                f"keep getting corrected — locking further corrections"
+            )
+            return
+        seen_patch_fingerprints.add(patch_fingerprint)
 
         logger.info(
             f"[Decoder] Re-selecting {len(patches_to_fix)} patches "
@@ -526,9 +604,11 @@ class SteganographyDecoder:
         )
 
         for pi in sorted(patches_to_fix):
+            if pi >= len(patch_records):
+                continue
             pr = patch_records[pi]
-            _, body_start, _ = patch_map[pi]
-            corrected_patch_bits = corrected_bits[
+            _, body_start, _ = block_patch_map[block_patch_indices.index(pi)]
+            corrected_patch_bits = re_encoded_bits[
                 body_start : body_start + len(pr.token_bits)
             ]
 

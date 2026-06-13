@@ -112,7 +112,11 @@ def compute_cumulative_probs(
         cumulative_probs = cumulative_probs[:overfill[0]]
     cumulative_probs += codebook_len - cumulative_probs[-1]
 
-    return logits_sorted, indices_sorted, cumulative_probs, k
+    # k must reflect the actual number of cumulative probability entries,
+    # NOT the pre-truncation value, since overfill clipping may have
+    # reduced its size.
+    actual_k = len(cumulative_probs)
+    return logits_sorted, indices_sorted, cumulative_probs, actual_k
 
 
 # ======================================================================
@@ -339,14 +343,12 @@ def run_diagnostics(
             decoder, context2, local_row2, local_col2, codebook_len
         )
 
-        # Find matching index
-        matching = torch.nonzero(indices_sorted2[:k2] == actual_token).squeeze()
+        # Find matching index — use the FIRST match if multiple
+        matching = torch.nonzero(indices_sorted2[:k2] == actual_token)
         if matching.numel() == 0:
-            match_pos = -1  # not found
-        elif matching.dim() == 0:
-            match_pos = matching.item()
-        else:
             match_pos = -1
+        else:
+            match_pos = matching[0].item()
 
         if match_pos >= 0:
             # Arithmetic decode

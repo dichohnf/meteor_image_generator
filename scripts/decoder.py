@@ -3,14 +3,14 @@ Steganographic decoder with block-wise Reed-Solomon error correction.
 
 Extracts hidden bits from image patches using arithmetic coding, but applies
 RS error correction *incrementally* per RS block — not on the entire message
-at once.  Each fixed-size RS block (10 payload bytes + 5 ECC bytes) is decoded
+at once.  Each fixed-size RS block (10 payload bytes + 6 ECC bytes) is decoded
 as soon as enough bits are received.  When RS corrects errors within a block,
 the corresponding patches are re-selected to prevent context poisoning of
 subsequent patches.
 
 Constants (must match pipeline):
     RS_BLOCK_BYTES = 10      # payload bytes per RS block
-    RS_NSYM = 5              # ECC parity symbols per block
+    RS_NSYM = 6              # ECC parity symbols per block (30% correction)
     RS_PAYLOAD_BITS = 80     # 10 × 8
 """
 
@@ -37,14 +37,15 @@ from scripts.error_correction import ReedSolomonCorrectionCode
 from scripts.pipeline import HEADER_LENGTH_BITS, XorMask
 
 # Block-wise RS parameters (must match pipeline.py)
-RS_NSYM = 5
+# nsym=6 → corrects up to 3 bytes out of 10 = 30% correction capability
+RS_NSYM = 6
 RS_BLOCK_BYTES = 10
 RS_PAYLOAD_BITS = RS_BLOCK_BYTES * 8  # 80
 
 # How many bits after XOR undo are needed for one RS block (variable due to 3-bit padding header)
-# Maximum possible: 3 padding header bits + (15 bytes * 8) = 123 bits
+# Maximum possible: 3 padding header bits + (16 bytes * 8) = 131 bits
 # Minimum possible: 3 padding header bits + (1 byte * 8) = 11 bits (bad case)
-RS_ENCODED_MAX_BITS = 3 + (RS_BLOCK_BYTES + RS_NSYM) * 8  # 123
+RS_ENCODED_MAX_BITS = 3 + (RS_BLOCK_BYTES + RS_NSYM) * 8  # 131
 RS_ENCODED_MIN_BITS = 3 + 8  # 11
 
 

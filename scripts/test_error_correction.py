@@ -2,7 +2,7 @@
 Test script for the Reed-Solomon error correction algorithm.
 
 RS is now the only ECC method (no Vote). Parameters are fixed:
-    nsym=5, block_bytes=10  (25%+ correction capability per 10-byte block)
+    nsym=6, block_bytes=10  (≈30% correction capability per 10-byte block)
 
 Tests:
 1. Basic encode/decode with no errors
@@ -28,8 +28,8 @@ logger_module.logger = type('Logger', (), {
 })()
 sys.modules['scripts.logger'] = logger_module
 
-# RS is always nsym=5 (fixed). These constants match the pipeline's block scheme.
-RS_NSYM = 5
+# RS is always nsym=6 (fixed). These constants match the pipeline's block scheme.
+RS_NSYM = 6
 RS_BLOCK_BYTES = 10
 
 from scripts.error_correction import ReedSolomonCorrectionCode
@@ -119,8 +119,8 @@ def test_block_encoding_multiple_blocks():
     ecc = ReedSolomonCorrectionCode(nsym=RS_NSYM)
     # 30-byte message → 30 bytes = 15 bytes padded = 15 encoded bytes = 120 bits
     # RS pads to unit of RS_BLOCK_BYTES (10 bytes), so 30 bytes → pads to 30 bytes
-    # (already multiple of 10). Then nsym=5 → 30*8 + 5*8 = 280 bits payload+ECC.
-    # With 3-bit header and byte padding, total is ~283 bits.
+    # (already multiple of 10). Then nsym=6 → 30*8 + 6*8 = 288 bits payload+ECC.
+    # With 3-bit header and byte padding, total is ~291 bits.
     original = "A" * 30
     bits = bits_from_string(original)
     encoded = ecc.encode(bits)
@@ -129,8 +129,8 @@ def test_block_encoding_multiple_blocks():
 
     assert decoded == original, f"FAIL: '{decoded}' != '{original}'"
     # reedsolo encodes the entire message as a single RS codeword,
-    # adding nsym=5 parity bytes at the end.
-    # 30 bytes → 30 + 5 = 35 bytes = 280 bits, plus 3-bit header = 283 bits.
+    # adding nsym=6 parity bytes at the end.
+    # 30 bytes → 30 + 6 = 36 bytes = 288 bits, plus 3-bit header = 291 bits.
     expected_min_len = len(bits) + RS_NSYM * 8 + 3  # bits + ECC + header
     assert len(encoded) >= expected_min_len, \
         f"Encoded too short: {len(encoded)} < {expected_min_len} (raw body {len(bits)}b)"
@@ -197,7 +197,7 @@ def test_overhead_ratio():
 if __name__ == "__main__":
     print()
     print("=" * 60)
-    print("RS ERROR CORRECTION TESTS (fixed nsym=5, block_bytes=10)")
+    print("RS ERROR CORRECTION TESTS (fixed nsym=6, block_bytes=10)")
     print("=" * 60)
     print()
 

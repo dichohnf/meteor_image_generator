@@ -7,17 +7,19 @@ VQGAN image encoding/decoding::
     encode:  message (str) → CharToBits → split (header+body) into 10-byte
              blocks → RS-encode each block → strip RS padding header →
              concatenate → XOR
-    decode:  bits (str)    → XOR undo → split into fixed 120-bit blocks →
+    decode:  bits (str)    → XOR undo → split into fixed 128-bit blocks →
              restore 3-bit pad header → RS-decode each block → trim to
              expected payload → extract length header → take body → BitsToChar
 
 The pipeline is self-contained: the encoder/decoder return raw bits
 and never see the internals of the pipeline.
 
-RS:  Each 10-byte payload block is RS-encoded with nsym=5 → 15 bytes.
+RS:  Each 10-byte payload block is RS-encoded with nsym=6 → 16 bytes.
      The 3-bit padding header that ReedSolomonCorrectionCode.encode adds
      is stripped/restored internally by the pipeline so that each block
-     occupies exactly (10 + 5) * 8 = 120 bits in the transmitted stream.
+     occupies exactly (10 + 6) * 8 = 128 bits in the transmitted stream.
+     With nsym=6, up to 3 erroneous bytes per 10-byte block can be
+     corrected, providing 30% correction capability.
 """
 
 from typing import Optional, Dict, Any, Tuple, List
@@ -30,13 +32,14 @@ from scripts.logger import logger
 HEADER_LENGTH_BITS = 13
 
 # Block-wise Reed-Solomon parameters
+# nsym=6 → corrects up to 3 erroneous bytes per 10-byte block (30% correction)
 RS_BLOCK_BYTES = 10       # payload bytes per RS block
-RS_NSYM = 5               # ECC parity symbols per block
+RS_NSYM = 6               # ECC parity symbols per block
 RS_PAYLOAD_BITS = RS_BLOCK_BYTES * 8         # 80 bits
 
-# Encoded size of a full block (10 payload bytes + 5 ECC bytes) = 15 bytes = 120 bits
+# Encoded size of a full block (10 payload bytes + 6 ECC bytes) = 16 bytes = 128 bits
 # after stripping the 3-bit RS-internal padding header.
-RS_ENCODED_BITS = (RS_BLOCK_BYTES + RS_NSYM) * 8  # 120 bits
+RS_ENCODED_BITS = (RS_BLOCK_BYTES + RS_NSYM) * 8  # 128 bits
 
 
 # ======================================================================
@@ -65,7 +68,7 @@ def _decode_length_from_body(body_decoded: str) -> int:
 
 
 # ======================================================================
-#  Block-wise RS helpers  (fixed-size blocks, 120 bits each)
+#  Block-wise RS helpers  (fixed-size blocks, 128 bits each)
 # ======================================================================
 
 def _split_into_rs_blocks(bits: str) -> List[str]:
@@ -81,11 +84,11 @@ def _split_into_rs_blocks(bits: str) -> List[str]:
 
 def encode_block_fixed_size(block_bits: str, ecc: ReedSolomonCorrectionCode) -> str:
     """
-    RS-encode a single block and return exactly RS_ENCODED_BITS (120 bits).
+    RS-encode a single block and return exactly RS_ENCODED_BITS (128 bits).
 
     1. Pad block_bits to RS_PAYLOAD_BITS (80 bits).
-    2. RS-encode via ecc.encode() → 123 bits (3 pad header + 120 body).
-    3. Strip the 3-bit padding header → 120 bits.
+    2. RS-encode via ecc.encode() → 131 bits (3 pad header + 128 body).
+    3. Strip the 3-bit padding header → 128 bits.
 
     This guarantees that every block (including the last) occupies exactly
     RS_ENCODED_BITS in the transmitted stream, making the decoder's job
@@ -102,13 +105,13 @@ def encode_block_fixed_size(block_bits: str, ecc: ReedSolomonCorrectionCode) -> 
 def decode_block_fixed_size(encoded_bits: str, ecc: ReedSolomonCorrectionCode,
                             expected_payload_bits: int) -> str:
     """
-    RS-decode a single fixed-size block (RS_ENCODED_BITS = 120 bits).
+    RS-decode a single fixed-size block (RS_ENCODED_BITS = 128 bits).
 
     Restores the 3-bit padding header before calling ecc.decode(), then
     trims the result to expected_payload_bits.
 
     Args:
-        encoded_bits: Exactly RS_ENCODED_BITS (120) bits.
+        encoded_bits: Exactly RS_ENCODED_BITS (128) bits.
         ecc: The RS codec instance.
         expected_payload_bits: Expected payload size (80 for full blocks, less for last).
 
@@ -303,7 +306,7 @@ class SteganoPipeline:
         Run encode_message step-by-step and record each intermediate.
 
         New order: str→bits → split into 10-byte RS blocks →
-                   RS-encode each (fixed 120-bit output) → concatenate → XOR.
+                   RS-encode each (fixed 128-bit output) → concatenate → XOR.
         """
         trace = []
 
@@ -362,7 +365,7 @@ class SteganoPipeline:
         """
         Run decode_message step-by-step and record each intermediate.
 
-        New order: XOR undo → split into fixed 120-bit RS blocks →
+        New order: XOR undo → split into fixed 128-bit RS blocks →
                    RS-decode each → concatenate decoded blocks →
                    extract header → take body → bits→str.
         """
@@ -377,7 +380,7 @@ class SteganoPipeline:
         trace.append(("xor_sample", corrected[:40]))
 
         # Step 2: Split into fixed-size blocks and decode each.
-        # Each block is exactly RS_ENCODED_BITS (120 bits), except possibly
+        # Each block is exactly RS_ENCODED_BITS (128 bits), except possibly
         # the last block if the stream was truncated.
         blocks_info = []
         decoded_parts: List[str] = []

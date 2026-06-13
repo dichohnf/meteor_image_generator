@@ -65,8 +65,9 @@ class Options:
     Configuration class holding all settings for the steganography encoding and decoding process.
     Manages message, model paths, generation parameters, and output configurations.
 
-    Error correction uses Reed-Solomon with fixed nsym=5 on 10-byte blocks.
-    No user-configurable ECC parameters are exposed.
+    Error correction uses Reed-Solomon with fixed nsym=6 on 10-byte blocks,
+    providing ~30% correction capability. No user-configurable ECC parameters
+    are exposed.
     """
 
     def __init__(

@@ -29,7 +29,7 @@ def _options_to_dict(options: Options) -> dict:
         "to_gen_number": options.to_gen_number,
         "output_directory": options.output_directory,
         "random_generation": options.random_generation,
-        "ecc": "RS(nsym=5,block=10B)",
+        "ecc": "RS(nsym=6,block=10B)",
     }
 
 
